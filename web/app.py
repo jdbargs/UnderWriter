@@ -2,109 +2,107 @@ import streamlit as st
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.db import sign_up, sign_in, get_current_user, sign_out, save_writing, list_writings
-from src.analyzer import analyze_text  # optional; keep for profiling
-from src.ai_feedback import get_ai_feedback  # optional; comment out if not ready
+from src.db import (
+    save_writing, list_writings, get_current_user,
+    insert_writing_insight, insert_companion_feedback,
+    upsert_style_profile, insert_style_snapshot, count_writings,
+)
+from src.analyzer import analyze_text
+from src.tone_classifier import classify_tone  # your heuristic tone
+from src.ai_feedback import get_ai_feedback    # your LLM reflection
 
-st.set_page_config(page_title="Style Profiler", page_icon="✍️", layout="centered")
+# --- assume you already set st.session_state.user with {id,email} after login ---
 
-# Session
-if "user" not in st.session_state:
-    st.session_state.user = None
+st.subheader("New Writing")
+title = st.text_input("Title (optional)")
+text = st.text_area("Write or paste text", height=180)
 
-def require_auth_ui():
-    st.title("✍️ Style Profiler — Sign in")
+def infer_intention(txt: str) -> str:
+    t = txt.lower()
+    if "?" in txt:
+        return "inquisitive"
+    if any(w in t for w in ["i think", "maybe", "perhaps", "wonder"]):
+        return "exploratory"
+    if any(w in t for w in ["should", "must", "need to", "important"]):
+        return "persuasive"
+    if any(w in t for w in ["i feel", "i'm", "sad", "happy", "excited"]):
+        return "expressive"
+    return "descriptive"
 
-    tabs = st.tabs(["Sign In", "Sign Up"])
-    with tabs[0]:
-        with st.form("signin"):
-            email = st.text_input("Email", key="signin_email")
-            password = st.text_input("Password", type="password", key="signin_pw")
-            submitted = st.form_submit_button("Sign In")
-            if submitted:
-                try:
-                    res = sign_in(email, password)
-                    # Persist session in supabase client automatically
-                    user = get_current_user().user
-                    st.session_state.user = {"id": user.id, "email": user.email}
-                    st.success("Signed in.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Sign in failed: {e}")
+def infer_energy(metrics) -> str:
+    # toy heuristic: longer avg sentence ≈ calmer/reflective; shorter ≈ higher energy
+    avg_len = metrics.get("sentence_length_avg", 0)
+    if avg_len >= 22: return "calm/expansive"
+    if avg_len >= 15: return "steady"
+    return "brisk"
 
-    with tabs[1]:
-        with st.form("signup"):
-            email_su = st.text_input("Email", key="signup_email")
-            password_su = st.text_input("Password", type="password", key="signup_pw")
-            submitted_su = st.form_submit_button("Create Account")
-            if submitted_su:
-                try:
-                    sign_up(email_su, password_su)
-                    st.success("Account created. Please sign in.")
-                except Exception as e:
-                    st.error(f"Sign up failed: {e}")
-
-def app_ui():
-    st.title("✍️ Style Profiler")
-    st.caption(f"Logged in as {st.session_state.user['email']}")
-    colA, colB = st.columns([1,1])
-    with colB:
-        if st.button("Log out"):
-            try:
-                sign_out()
-            finally:
-                st.session_state.user = None
-                st.rerun()
-
-    st.subheader("New Writing")
-    title = st.text_input("Title (optional)")
-    text = st.text_area("Write or paste text", height=180)
-
-    if st.button("Analyze & Save"):
-        if text.strip():
-            # Optional analysis—use internally; don't show raw metrics
-            _metrics = analyze_text(text)
-
-            # Optional AI reflection (comment out if API not configured)
-            try:
-                profile_summary = "Learning your style; reflections will deepen as you write more."
-                feedback = get_ai_feedback(text, profile_summary)
-                st.markdown("**Reflection:**")
-                st.write(feedback)
-            except Exception as e:
-                st.info(f"(AI feedback unavailable) {e}")
-
-            # Save to DB
-            try:
-                save_writing(st.session_state.user["id"], text, title=title or None, metadata={})
-                st.success("Saved.")
-            except Exception as e:
-                st.error(f"Save failed: {e}")
-
-    st.divider()
-    st.subheader("Your Past Writings")
-    try:
-        writings = list_writings(st.session_state.user["id"])
-        if not writings:
-            st.write("No entries yet.")
-        else:
-            for w in writings:
-                st.markdown(f"**{w.get('title') or '(untitled)'}** — _{w['created_at']}_")
-                st.code(w["text"])
-                st.markdown("---")
-    except Exception as e:
-        st.error(f"Could not load writings: {e}")
-
-# Gate by auth
-try:
-    if st.session_state.user is None:
+if st.button("Analyze & Save"):
+    if not text.strip():
+        st.warning("Please enter some text.")
+    else:
         user = get_current_user().user
-        if user:
-            st.session_state.user = {"id": user.id, "email": user.email}
-except Exception:
-    pass
+        user_id = user.id
 
-if st.session_state.user is None:
-    require_auth_ui()
-else:
-    app_ui()
+        # 1) Save writing
+        writing = save_writing(user_id, text, title=title or None, metadata={})
+        writing_id = writing["id"]
+
+        # 2) Compute basic metrics (internal only)
+        metrics = analyze_text(text)
+        tone = classify_tone(text)
+        intention = infer_intention(text)
+        energy = infer_energy(metrics)
+
+        # 3) LLM reflection (Companion)
+        try:
+            # Minimal profile summary (you can fetch style_profiles later for richer context)
+            profile_summary = "Learning your style; reflections deepen as you write more."
+            feedback = get_ai_feedback(text, profile_summary)
+        except Exception as e:
+            feedback = f"(AI feedback unavailable) {e}"
+
+        # 4) Insert insights + feedback rows
+        try:
+            insert_writing_insight(
+                writing_id=writing_id,
+                intention=intention,
+                tone=tone,
+                energy=energy,
+                observations=None,            # optional: short natural-language summary (Archivist later)
+                micro_suggestions=[],         # optional: fill as you implement micro-edits
+                metrics={"avg_sentence_len": metrics.get("sentence_length_avg"),
+                        "vocab_richness": metrics.get("vocab_richness")}
+            )
+            insert_companion_feedback(writing_id, feedback, mode="spotlight")
+            st.success("Saved and analyzed.")
+            st.markdown("**Reflection:**")
+            st.write(feedback)
+        except Exception as e:
+            st.error(f"Save insights/feedback failed: {e}")
+
+        # 5) Periodically update the style profile + snapshot
+        try:
+            total = count_writings(user_id)
+            if total % 5 == 0:  # every 5th submission
+                # crude snapshot for now—replace with Archivist AI summary later
+                snapshot = f"By entry {total}, tone leans '{tone}' with '{intention}' intent; energy reads '{energy}'."
+                upsert_style_profile(user_id, summary=snapshot, traits={})
+                insert_style_snapshot(user_id, snapshot=snapshot, signals={"k": "v"})
+        except Exception:
+            pass  # non-fatal
+
+st.divider()
+st.subheader("Your Past Writings")
+
+try:
+    user = get_current_user().user
+    writings = list_writings(user.id)
+    if not writings:
+        st.write("No entries yet.")
+    else:
+        for w in writings:
+            with st.expander(f"{w.get('title') or '(untitled)'} — {w['created_at']}"):
+                st.code(w["text"])
+                # you can also fetch and show latest feedback/insights here if you want
+except Exception as e:
+    st.error(f"Could not load writings: {e}")
