@@ -1,5 +1,8 @@
 # src/db.py
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta, timezone
+import random
+
 from .supabase_client import supabase
 
 # ---------- Auth ----------
@@ -111,3 +114,159 @@ def list_style_snapshots(user_id: str) -> List[Dict[str, Any]]:
         .execute()
     )
     return res.data or []
+
+# ==========================================================
+# ================== FlowState (Practice) ==================
+# ==========================================================
+
+# ---------- Prompts ----------
+def random_flow_prompt(tag: Optional[str] = None, difficulty: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """
+    Fetch up to 50 recent prompts (optionally filtered) and return one at random.
+    For proper weighting/randomness, consider a server-side RPC later.
+    """
+    q = supabase.table("flow_prompts").select("*")
+    if tag:
+        q = q.eq("tag", tag)
+    if difficulty:
+        q = q.eq("difficulty", difficulty)
+    res = q.order("created_at", desc=True).limit(50).execute()
+    rows = res.data or []
+    return random.choice(rows) if rows else None
+
+# ---------- Sessions ----------
+def create_flow_session(
+    user_id: str,
+    mode: str,
+    duration_seconds: Optional[int],
+    target_words: Optional[int],
+    goal_focus: Optional[List[str]],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "user_id": user_id,
+        "mode": mode,
+        "duration_seconds": duration_seconds,
+        "target_words": target_words,
+        "goal_focus": goal_focus,
+    }
+    res = supabase.table("flow_sessions").insert(payload).execute()
+    return (res.data or [None])[0]
+
+# ---------- Attempts ----------
+def insert_flow_attempt(
+    session_id: str,
+    prompt_id: Optional[str],
+    user_id: str,
+    response_text: str,
+    start_time: Optional[datetime],
+    end_time: Optional[datetime],
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "user_id": user_id,
+        "response_text": response_text,
+        "start_time": (start_time or datetime.now(timezone.utc)).isoformat(),
+        "end_time": (end_time or datetime.now(timezone.utc)).isoformat(),
+        "meta": meta or {},
+    }
+    res = supabase.table("flow_attempts").insert(payload).execute()
+    return (res.data or [None])[0]
+
+# ---------- Metrics ----------
+def insert_flow_metrics(
+    attempt_id: str,
+    user_id: str,
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = {"attempt_id": attempt_id, "user_id": user_id, **metrics}
+    res = supabase.table("flow_metrics").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_flow_recent_metrics(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("flow_metrics")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+def user_metric_baseline(user_id: str, metric_field: str, days: int = 7) -> Optional[float]:
+    """
+    Rolling average for a metric over the past N days.
+    Returns None if not enough data.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    res = (
+        supabase.table("flow_metrics")
+        .select(f"{metric_field}, created_at")
+        .eq("user_id", user_id)
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(200)
+        .execute()
+    )
+    rows = res.data or []
+    vals = [r.get(metric_field) for r in rows if r.get(metric_field) is not None]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+# ---------- Feedback ----------
+def insert_flow_feedback(
+    attempt_id: str,
+    user_id: str,
+    feedback_text: str,
+) -> Dict[str, Any]:
+    payload = {"attempt_id": attempt_id, "user_id": user_id, "feedback": feedback_text}
+    res = supabase.table("flow_feedback").insert(payload).execute()
+    return (res.data or [None])[0]
+
+# ---------- Goals & Progress ----------
+def upsert_flow_goal(user_id: str, focus: str, target: float, window_days: int = 14, active: bool = True) -> Dict[str, Any]:
+    """
+    Emulate upsert by (user_id, focus, active=True). If one exists, update; else insert.
+    """
+    existing = (
+        supabase.table("flow_goals")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("focus", focus)
+        .eq("active", True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if existing:
+        goal_id = existing[0]["id"]
+        res = (
+            supabase.table("flow_goals")
+            .update({"target": target, "window_days": window_days, "active": active})
+            .eq("id", goal_id)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    else:
+        payload = {"user_id": user_id, "focus": focus, "target": target, "window_days": window_days, "active": active}
+        res = supabase.table("flow_goals").insert(payload).execute()
+        return (res.data or [None])[0]
+
+def active_flow_goals(user_id: str) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("flow_goals")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("active", True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+def insert_flow_progress(goal_id: str, attempt_id: str, metric_value: float, delta: float) -> Dict[str, Any]:
+    payload = {"goal_id": goal_id, "attempt_id": attempt_id, "metric_value": metric_value, "delta": delta}
+    res = supabase.table("flow_progress").insert(payload).execute()
+    return (res.data or [None])[0]
