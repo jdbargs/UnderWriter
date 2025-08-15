@@ -2,6 +2,17 @@
 import streamlit as st
 import sys, os
 from datetime import datetime, timezone
+import io
+
+# Optional file parsers for rubric uploads
+try:
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
+try:
+    import docx  # python-docx
+except Exception:
+    docx = None
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -15,6 +26,13 @@ from src.db import (
     # FlowState additions
     create_flow_session, random_flow_prompt, insert_flow_attempt,
     insert_flow_metrics, user_metric_baseline, insert_flow_feedback,
+    # GradeSim
+    create_rubric, list_rubrics, get_rubric, archive_rubric,
+    add_rubric_criterion, list_rubric_criteria, update_rubric_criterion, delete_rubric_criterion,
+    add_grading_sample, list_grading_samples, delete_grading_sample,
+    create_grader_version, list_grader_versions, set_active_grader_version, get_active_grader_version,
+    # Roles
+    get_profile, upsert_profile
 )
 from src.supabase_client import supabase
 
@@ -22,6 +40,7 @@ from src.supabase_client import supabase
 from src.analyzer import analyze_text, analyze_flow_text, compute_flow_composite
 from src.tone_classifier import classify_tone
 from src.ai_feedback import get_ai_feedback, get_flow_feedback
+from src.ai_grader import extract_rubric_schema
 
 st.set_page_config(page_title="UnderWriter", page_icon="✍️", layout="centered")
 
@@ -64,17 +83,15 @@ def auth_screen():
         with st.form("signin_form"):
             email = st.text_input("Email", key="signin_email")
             password = st.text_input("Password", type="password", key="signin_pw")
-            submitted = st.form_submit_button("Sign In")
+            submitted = st.form_submit_button("Sign In", use_container_width=True)
             if submitted:
                 try:
                     res = sign_in(email, password)
                     session = res.session
-                    # persist tokens so we can restore across reruns
                     st.session_state.sb_session = {
                         "access_token": session.access_token,
                         "refresh_token": session.refresh_token,
                     }
-                    # set into client immediately
                     set_session(session.access_token, session.refresh_token)
                     user = get_current_user().user
                     st.session_state.user = {"id": user.id, "email": user.email}
@@ -87,7 +104,7 @@ def auth_screen():
         with st.form("signup_form"):
             email_su = st.text_input("Email", key="signup_email")
             password_su = st.text_input("Password", type="password", key="signup_pw")
-            submitted_su = st.form_submit_button("Create Account")
+            submitted_su = st.form_submit_button("Create Account", use_container_width=True)
             if submitted_su:
                 try:
                     sign_up(email_su, password_su)
@@ -95,7 +112,9 @@ def auth_screen():
                 except Exception as e:
                     st.error(f"Sign up failed: {e}")
 
-# ---- FlowState UI (Practice Mode) ----
+# ----------------------------
+# FlowState (Practice) section
+# ----------------------------
 def flowstate_section():
     st.header("FlowState — quick bursts for flow & style")
 
@@ -127,6 +146,7 @@ def flowstate_section():
                 "Mode",
                 ["timed", "wordcount", "free"],
                 index=["timed", "wordcount", "free"].index(st.session_state.fs_mode),
+                key="fs_mode_select",
             )
         with c2:
             duration = st.number_input(
@@ -136,6 +156,7 @@ def flowstate_section():
                 value=st.session_state.fs_duration,
                 step=15,
                 disabled=(mode != "timed"),
+                key="fs_duration_input",
             )
         with c3:
             target_words = st.number_input(
@@ -145,15 +166,17 @@ def flowstate_section():
                 value=st.session_state.fs_target_words,
                 step=10,
                 disabled=(mode != "wordcount"),
+                key="fs_target_words_input",
             )
 
         goals = st.multiselect(
             "Focus goals",
             ["playfulness", "clarity", "creativity"],
             default=st.session_state.fs_goals,
+            key="fs_goals_multiselect",
         )
 
-        start_burst = st.form_submit_button("Start burst")
+        start_burst = st.form_submit_button("Start burst", use_container_width=True)
 
     if start_burst:
         # Persist setup
@@ -186,7 +209,7 @@ def flowstate_section():
 
         # Begin writing → record start time
         if st.session_state.fs_started_at is None:
-            if st.button("Begin writing"):
+            if st.button("Begin writing", key="fs_begin_btn"):
                 st.session_state.fs_started_at = datetime.now(timezone.utc)
         else:
             st.caption(f"Started at {st.session_state.fs_started_at.isoformat()} (UTC)")
@@ -197,10 +220,11 @@ def flowstate_section():
             value=st.session_state.fs_response,
             height=200,
             placeholder="Type fast. Don’t overthink.",
+            key="fs_response_text",
         )
 
         # Submit attempt
-        if st.session_state.fs_started_at and st.button("Submit"):
+        if st.session_state.fs_started_at and st.button("Submit", key="fs_submit_btn"):
             end_time = datetime.now(timezone.utc)
             elapsed = (end_time - st.session_state.fs_started_at).total_seconds()
 
@@ -283,12 +307,230 @@ def flowstate_section():
             st.session_state.fs_started_at = None
             st.info("New prompt loaded. Hit **Begin writing** when ready.")
 
-# ---- App UI (authed) ----
+# ----------------------------
+# GradeSim — Teacher Console
+# ----------------------------
+def _read_uploaded_text(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    buf = io.BytesIO(data)
+
+    if name.endswith(".pdf"):
+        if not PyPDF2:
+            return "(Install PyPDF2 to parse PDFs)"
+        try:
+            reader = PyPDF2.PdfReader(buf)
+            pages = [p.extract_text() or "" for p in reader.pages]
+            return "\n\n".join(pages).strip()
+        except Exception:
+            return "(Could not parse PDF. Try a .docx or .txt.)"
+
+    if name.endswith(".docx"):
+        if not docx:
+            return "(Install python-docx to parse DOCX)"
+        try:
+            d = docx.Document(buf)
+            return "\n".join(p.text for p in d.paragraphs).strip()
+        except Exception:
+            return "(Could not parse DOCX. Try a PDF or .txt.)"
+
+    # Fallback: treat as text
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return "(Unsupported file encoding)"
+
+def gradesim_teacher_section():
+    st.header("GradeSim — Teacher Console")
+
+    # user/role
+    uid = current_user_id()
+    prof = get_profile(uid) if uid else None
+    role = (prof or {}).get("role", "student")
+    if role not in ("teacher", "admin"):
+        st.info("Only teachers can access GradeSim. Update your profile role to 'teacher' if you're testing.")
+        return
+
+    # ---- Rubric import (upload → extract → tweak → save) ----
+    st.subheader("Create or import a rubric")
+    up_col1, up_col2 = st.columns([2,1])
+    with up_col1:
+        uploaded = st.file_uploader(
+            "Upload rubric (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], key="rubric_uploader"
+        )
+    with up_col2:
+        scale_choice = st.selectbox("Preferred scale (fallback)", ["0-4", "0-100"], index=0, key="pref_scale_select")
+
+    if uploaded:
+        raw_text = _read_uploaded_text(uploaded)
+        if not raw_text or raw_text.startswith("("):
+            st.error(raw_text or "Could not read file.")
+        else:
+            with st.spinner("Extracting rubric…"):
+                schema = extract_rubric_schema(raw_text)
+            if not schema.get("scale"):
+                schema["scale"] = scale_choice
+
+            st.success(f"Extracted: {schema.get('title','(untitled)')}")
+            crit_names = [c["name"] for c in schema["criteria"]]
+            st.markdown("**Criteria & weights (adjust if needed)**")
+            new_weights = []
+            for idx, c in enumerate(schema["criteria"]):
+                col1, col2 = st.columns([3,2])
+                col1.write(f"**{c['name']}**")
+                w = col2.slider(
+                    f"Weight: {c['name']}",
+                    0.0, 1.0, float(c.get("weight", 0.25)),
+                    0.05, key=f"rubric_weight_{idx}"
+                )
+                new_weights.append(w)
+            total = sum(new_weights) or 1.0
+            for i, c in enumerate(schema["criteria"]):
+                c["weight"] = round(new_weights[i] / total, 4)
+
+            st.markdown("**Preview**")
+            st.dataframe(
+                [{"Criterion": c["name"], "Weight": c["weight"]} for c in schema["criteria"]],
+                use_container_width=True,
+            )
+            st.caption("Descriptor levels were captured; you can refine them later.")
+
+            if st.button("Save rubric", key="save_extracted_rubric_btn"):
+                rrow = create_rubric(
+                    teacher_id=uid,
+                    title=schema.get("title") or "(untitled)",
+                    subject=None,
+                    grade_level=None,
+                    scale=schema.get("scale") or "0-4",
+                )
+                for c in schema["criteria"]:
+                    add_rubric_criterion(
+                        rubric_id=rrow["id"],
+                        name=c["name"],
+                        descriptor_levels=c.get("descriptor_levels") or {"4":"","3":"","2":"","1":"","0":""},
+                        weight=float(c["weight"]),
+                    )
+                st.success(f"Saved rubric '{rrow['title']}' with {len(schema['criteria'])} criteria.")
+
+    st.divider()
+    st.subheader("Manage rubrics / criteria (optional)")
+    rubrics = list_rubrics(uid)
+    if not rubrics:
+        st.caption("No rubrics yet. Upload one above.")
+        return
+
+    rubric_map = {f"{r['title']} ({r['id'][:8]})": r for r in rubrics}
+    sel_label = st.selectbox("Select a rubric", list(rubric_map.keys()), key="rubric_select_existing")
+    rubric = rubric_map[sel_label]
+    st.markdown(f"**Selected:** {rubric['title']} — scale `{rubric['scale']}`")
+
+    crits = list_rubric_criteria(rubric["id"])
+    if crits:
+        for c in crits:
+            with st.expander(f"{c['name']} — weight {c['weight']}"):
+                st.json(c["descriptor_levels"], expanded=False)
+                colu1, colu2, colu3 = st.columns([1,1,1])
+                new_name = colu1.text_input(
+                    f"Rename ({c['id'][:6]})",
+                    value=c["name"],
+                    key=f"crit_name_{c['id']}"
+                )
+                new_weight = colu2.number_input(
+                    f"Weight ({c['id'][:6]})",
+                    min_value=0.0, max_value=1.0,
+                    value=float(c["weight"]),
+                    step=0.05,
+                    key=f"crit_weight_{c['id']}"
+                )
+                if colu3.button(f"Save ({c['id'][:6]})", key=f"crit_save_{c['id']}"):
+                    update_rubric_criterion(c["id"], name=new_name, weight=new_weight)
+                    st.success("Updated. Refresh to see changes.")
+                if st.button(f"Delete criterion {c['id'][:6]}", key=f"crit_del_{c['id']}"):
+                    delete_rubric_criterion(c["id"])
+                    st.warning("Deleted. Refresh to see changes.")
+
+    # ---- (Optional) Manual add criterion retained, but no JSON required to use GradeSim ----
+    with st.form("add_criterion"):
+        st.caption("Add a criterion (optional)")
+        cc1, cc2 = st.columns([1,1])
+        name = cc1.text_input("Criterion name", placeholder="Thesis, Evidence, Organization…", key="crit_add_name")
+        weight = cc2.number_input("Weight (0–1)", min_value=0.0, max_value=1.0, value=0.25, step=0.05, key="crit_add_weight")
+        st.write("Descriptor levels (JSON): e.g. {\"4\":\"mastery…\",\"3\":\"…\",\"2\":\"…\",\"1\":\"…\",\"0\":\"…\"}")
+        raw_json = st.text_area("Descriptors JSON", height=120, placeholder='{"4":"…","3":"…","2":"…","1":"…","0":"…"}', key="crit_add_desc_json")
+        addc = st.form_submit_button("Add criterion", use_container_width=True)
+        if addc:
+            try:
+                import json
+                desc = json.loads(raw_json) if raw_json.strip() else {"4":"","3":"","2":"","1":"","0":""}
+                add_rubric_criterion(rubric["id"], name=name.strip(), descriptor_levels=desc, weight=float(weight))
+                st.success("Criterion added.")
+            except Exception as e:
+                st.error(f"Bad JSON or save failed: {e}")
+
+    st.divider()
+    st.subheader("Grading Samples (Anchors)")
+    samples = list_grading_samples(uid, rubric_id=rubric["id"])
+    if samples:
+        for s in samples[:10]:
+            with st.expander(f"{(s.get('title') or '(untitled)')} — {s['id'][:8]}"):
+                st.code(s["text"][:800] + ("..." if len(s["text"]) > 800 else ""))
+                st.json({"overall": s.get("overall"), "per_criterion": s.get("per_criterion")}, expanded=False)
+                if st.button(f"Delete sample {s['id'][:6]}", key=f"sample_del_{s['id']}"):
+                    delete_grading_sample(s["id"])
+                    st.warning("Sample deleted. Refresh to update list.")
+
+    with st.form("add_sample"):
+        st.caption("Add a graded sample (optional but improves calibration)")
+        s1, s2 = st.columns([2,1])
+        title = s1.text_input("Sample title (optional)", key="sample_title_input")
+        overall = s2.number_input(f"Overall ({rubric['scale']})", min_value=0.0, max_value=100.0, value=3.0, step=0.5, key="sample_overall_input")
+        text = st.text_area("Student text", height=180, key="sample_text_input")
+        st.write("Per-criterion scores JSON (e.g., {\"Thesis\":3,\"Evidence\":4})")
+        raw_scores = st.text_area("Scores JSON", height=100, key="sample_scores_json")
+        add_s = st.form_submit_button("Save sample", use_container_width=True)
+        if add_s:
+            try:
+                import json
+                pc = json.loads(raw_scores) if raw_scores.strip() else {}
+                add_grading_sample(uid, rubric["id"], title=title or None, text=text, overall=float(overall), per_criterion=pc)
+                st.success("Sample saved.")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
+    st.divider()
+    st.subheader("Grader Versions")
+    versions = list_grader_versions(uid, rubric["id"])
+    active = get_active_grader_version(uid, rubric["id"])
+    if versions:
+        st.caption(f"Active version: **{active['version']}**" if active else "No active version.")
+        for v in versions:
+            with st.expander(f"Version {v['version']} — {'ACTIVE' if v['is_active'] else 'inactive'}"):
+                st.json({"method": v["method"], "config": v["config"], "train_stats": v.get("train_stats")})
+                if not v["is_active"]:
+                    if st.button(f"Activate v{v['version']}", key=f"activate_v_{v['id']}"):
+                        set_active_grader_version(uid, rubric["id"], v["id"])
+                        st.success("Activated.")
+    with st.form("new_version"):
+        st.caption("Create a new version (stores config; you control anchors & parameters)")
+        leniency = st.slider("Leniency (0=stricter, 1=lenient)", 0.0, 1.0, 0.5, 0.05, key="leniency_slider")
+        sample_options = {f"{(s.get('title') or 'untitled')} [{s['id'][:6]}]": s["id"] for s in samples}
+        chosen = st.multiselect("Anchor samples (recommended: 3–6 across the range)", list(sample_options.keys()), key="anchor_multiselect")
+        create_v = st.form_submit_button("Create version", use_container_width=True)
+        if create_v:
+            config = {"leniency": leniency, "anchors": [sample_options[k] for k in chosen]}
+            vrow = create_grader_version(uid, rubric["id"], config=config, method="few_shot_prompt", train_stats=None, is_active=False)
+            st.success(f"Created version {vrow['version']}. Activate when ready.")
+
+# ----------------------------
+# App UI (authed)
+# ----------------------------
 def app_screen():
     st.title("✍️ UnderWriter")
     st.caption(f"Logged in as {st.session_state.user['email']}")
 
-    if st.button("Log out"):
+    if st.button("Log out", key="logout_btn"):
         try:
             sign_out()
         finally:
@@ -296,12 +538,41 @@ def app_screen():
             st.session_state.sb_session = None
             st.rerun()
 
-    # Tabs: Core Writing | FlowState
-    tab_core, tab_flow = st.tabs(["Writing Companion", "FlowState (Practice)"])
-    with tab_core:
+    # ---- Role / Profile ----
+    uid = current_user_id()
+    prof = get_profile(uid) if uid else None
+    role = (prof or {}).get("role", "student")
+
+    with st.expander("Profile"):
+        st.write(f"Role: **{role}**")
+        colA, colB = st.columns(2)
+        new_name = colA.text_input(
+            "Display name",
+            value=(prof or {}).get("display_name", ""),
+            key="profile_display_name_input",
+        )
+        new_school = colB.text_input(
+            "School (optional)",
+            value=(prof or {}).get("school", ""),
+            key="profile_school_input",
+        )
+        if st.button("Save profile", key="profile_save_btn"):
+            upsert_profile(uid, display_name=new_name, school=new_school)
+            st.success("Profile saved.")
+
+    # ---- Tabs: Writing | FlowState | (GradeSim if teacher) ----
+    tabs = ["Writing Companion", "FlowState (Practice)"]
+    is_teacher_role = role in ("teacher", "admin")
+    if is_teacher_role:
+        tabs.append("GradeSim (Teacher)")
+
+    t_objs = st.tabs(tabs)
+
+    # --- Tab 0: Writing Companion ---
+    with t_objs[0]:
         st.subheader("New Writing")
-        title = st.text_input("Title (optional)")
-        text = st.text_area("Write or paste text", height=180)
+        title = st.text_input("Title (optional)", key="wc_title_input")
+        text = st.text_area("Write or paste text", height=180, key="wc_text_input")
 
         def infer_intention(txt: str) -> str:
             t = txt.lower()
@@ -317,7 +588,7 @@ def app_screen():
             if avg_len >= 15: return "steady"
             return "brisk"
 
-        if st.button("Analyze & Save"):
+        if st.button("Analyze & Save", key="wc_analyze_btn"):
             uid = current_user_id()
             if not uid:
                 st.error("You must be signed in to save.")
@@ -338,7 +609,6 @@ def app_screen():
                 intention = infer_intention(text)
                 energy = infer_energy(metrics)
             except Exception:
-                # if analyzer isn't configured, keep going
                 metrics, tone, intention, energy = {}, None, None, None
 
             # 3) LLM reflection (optional)
@@ -358,14 +628,15 @@ def app_screen():
                     intention=intention,
                     tone=tone,
                     energy=energy,
-                    observations=None,        # Archivist later
-                    micro_suggestions=[],     # fill as you add micro-edits
-                    metrics={"avg_sentence_len": metrics.get("sentence_length_avg"),
-                            "vocab_richness": metrics.get("vocab_richness")}
+                    observations=None,
+                    micro_suggestions=[],
+                    metrics={
+                        "avg_sentence_len": metrics.get("sentence_length_avg"),
+                        "vocab_richness": metrics.get("vocab_richness"),
+                    },
                 )
                 if feedback:
                     insert_companion_feedback(writing_id, feedback, mode="spotlight")
-
                 st.success("Saved.")
             except Exception as e:
                 st.error(f"Save insights/feedback failed: {e}")
@@ -382,7 +653,6 @@ def app_screen():
 
         st.divider()
         st.subheader("Your Past Writings")
-
         uid = current_user_id()
         if not uid:
             st.warning("Please sign in to view your writings.")
@@ -398,11 +668,16 @@ def app_screen():
             except Exception as e:
                 st.error(f"Could not load writings: {e}")
 
-    with tab_flow:
+    # --- Tab 1: FlowState ---
+    with t_objs[1]:
         flowstate_section()
 
+    # --- Tab 2: GradeSim (Teacher) ---
+    if is_teacher_role:
+        with t_objs[2]:
+            gradesim_teacher_section()
+
 # ---- Entry point ----
-# If we can detect a user, go to app; else show auth
 try:
     if st.session_state.user is None:
         u = get_current_user().user
@@ -415,57 +690,3 @@ if st.session_state.user is None:
     auth_screen()
 else:
     app_screen()
-
-# imports near top
-from src.db import get_profile, upsert_profile, is_teacher  # added
-
-# in app_screen(), after title/caption:
-uid = current_user_id()
-prof = get_profile(uid) if uid else None
-role = (prof or {}).get("role", "student")
-
-# quick dev switch (optional): let user toggle teacher for now
-with st.expander("Profile"):
-    st.write(f"Role: **{role}**")
-    colA, colB = st.columns(2)
-    new_name = colA.text_input("Display name", value=(prof or {}).get("display_name","") )
-    new_school = colB.text_input("School (optional)", value=(prof or {}).get("school","") )
-    if st.button("Save profile"):
-        upsert_profile(uid, display_name=new_name, school=new_school)
-        st.success("Profile saved.")
-
-# Tabs: Writing | FlowState | (Teacher Console if teacher)
-tabs = ["Writing Companion", "FlowState (Practice)"]
-if role in ("teacher","admin"):
-    tabs.append("Teacher Console")
-
-tab_objs = st.tabs(tabs)
-
-# existing content:
-with tab_objs[0]:
-    # Writing Companion ... (existing code)
-    ...
-
-with tab_objs[1]:
-    # FlowState ... (existing flowstate_section())
-    flowstate_section()
-
-# NEW Teacher Console (skeleton)
-if role in ("teacher","admin"):
-    with tab_objs[2]:
-        st.subheader("Teacher Console")
-        st.write("Create and manage your grading tools here.")
-
-        t1, t2, t3 = st.tabs(["Rubrics", "Grader Versions", "Classes (soon)"])
-
-        with t1:
-            st.caption("Define a rubric with criteria, descriptors, and weights.")
-            st.info("Coming next: rubric table + criteria editor.")
-
-        with t2:
-            st.caption("Train/activate your grading configuration.")
-            st.info("Coming next: anchor selection, leniency, versioning.")
-
-        with t3:
-            st.caption("Manage classes and enrollments for student access.")
-            st.info("Coming next: class codes and enroll/roster.")

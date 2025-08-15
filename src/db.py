@@ -287,3 +287,236 @@ def upsert_profile(user_id: str, display_name: str = None, school: str = None, r
 def is_teacher(user_id: str) -> bool:
     p = get_profile(user_id)
     return bool(p and p.get("role") in ("teacher","admin"))
+
+# ====== GradeSim: Rubrics, Criteria, Samples, Grader Versions, Requests/Results ======
+
+# ---------- Rubrics ----------
+def create_rubric(teacher_id: str, title: str, subject: Optional[str] = None,
+                  grade_level: Optional[str] = None, scale: str = "0-4") -> Dict[str, Any]:
+    payload = {
+        "teacher_id": teacher_id,
+        "title": title,
+        "subject": subject,
+        "grade_level": grade_level,
+        "scale": scale,
+    }
+    res = supabase.table("rubrics").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_rubrics(teacher_id: str) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("rubrics")
+        .select("*")
+        .eq("teacher_id", teacher_id)
+        .eq("archived", False)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+def get_rubric(rubric_id: str) -> Optional[Dict[str, Any]]:
+    res = supabase.table("rubrics").select("*").eq("id", rubric_id).single().execute()
+    return res.data
+
+def archive_rubric(rubric_id: str, archived: bool = True) -> Optional[Dict[str, Any]]:
+    res = supabase.table("rubrics").update({"archived": archived}).eq("id", rubric_id).execute()
+    return (res.data or [None])[0]
+
+# ---------- Rubric Criteria ----------
+def add_rubric_criterion(rubric_id: str, name: str, descriptor_levels: Dict[str, str],
+                         weight: float = 0.25) -> Dict[str, Any]:
+    payload = {
+        "rubric_id": rubric_id,
+        "name": name,
+        "descriptor_levels": descriptor_levels,
+        "weight": weight,
+    }
+    res = supabase.table("rubric_criteria").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_rubric_criteria(rubric_id: str) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("rubric_criteria")
+        .select("*")
+        .eq("rubric_id", rubric_id)
+        .execute()
+    )
+    return res.data or []
+
+def update_rubric_criterion(criterion_id: str, name: Optional[str] = None,
+                            descriptor_levels: Optional[Dict[str, str]] = None,
+                            weight: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    patch: Dict[str, Any] = {}
+    if name is not None: patch["name"] = name
+    if descriptor_levels is not None: patch["descriptor_levels"] = descriptor_levels
+    if weight is not None: patch["weight"] = weight
+    if not patch:
+        return get_rubric_criterion(criterion_id)
+    res = supabase.table("rubric_criteria").update(patch).eq("id", criterion_id).execute()
+    return (res.data or [None])[0]
+
+def get_rubric_criterion(criterion_id: str) -> Optional[Dict[str, Any]]:
+    res = supabase.table("rubric_criteria").select("*").eq("id", criterion_id).single().execute()
+    return res.data
+
+def delete_rubric_criterion(criterion_id: str) -> None:
+    supabase.table("rubric_criteria").delete().eq("id", criterion_id).execute()
+
+# ---------- Teacher Grading Samples (anchors) ----------
+def add_grading_sample(teacher_id: str, rubric_id: str, title: Optional[str],
+                       text: str, overall: Optional[float],
+                       per_criterion: Optional[Dict[str, Any]],
+                       rationales: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "teacher_id": teacher_id,
+        "rubric_id": rubric_id,
+        "title": title,
+        "text": text,
+        "overall": overall,
+        "per_criterion": per_criterion or {},
+        "rationales": rationales or {},
+    }
+    res = supabase.table("grading_samples").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_grading_samples(teacher_id: str, rubric_id: Optional[str] = None,
+                         limit: int = 50) -> List[Dict[str, Any]]:
+    q = (
+        supabase.table("grading_samples")
+        .select("*")
+        .eq("teacher_id", teacher_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if rubric_id:
+        q = q.eq("rubric_id", rubric_id)
+    res = q.execute()
+    return res.data or []
+
+def get_grading_sample(sample_id: str) -> Optional[Dict[str, Any]]:
+    res = supabase.table("grading_samples").select("*").eq("id", sample_id).single().execute()
+    return res.data
+
+def delete_grading_sample(sample_id: str) -> None:
+    supabase.table("grading_samples").delete().eq("id", sample_id).execute()
+
+# ---------- Grader Versions ----------
+def _next_grader_version_number(teacher_id: str, rubric_id: str) -> int:
+    res = (
+        supabase.table("teacher_grader_versions")
+        .select("version")
+        .eq("teacher_id", teacher_id)
+        .eq("rubric_id", rubric_id)
+        .order("version", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return int(res.data[0]["version"]) + 1
+    return 1
+
+def create_grader_version(teacher_id: str, rubric_id: str, config: Dict[str, Any],
+                          method: str = "few_shot_prompt", train_stats: Optional[Dict[str, Any]] = None,
+                          is_active: bool = False, version: Optional[int] = None) -> Dict[str, Any]:
+    ver = version or _next_grader_version_number(teacher_id, rubric_id)
+    payload = {
+        "teacher_id": teacher_id,
+        "rubric_id": rubric_id,
+        "version": ver,
+        "method": method,
+        "config": config or {},
+        "train_stats": train_stats,
+        "is_active": is_active,
+    }
+    res = supabase.table("teacher_grader_versions").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def set_active_grader_version(teacher_id: str, rubric_id: str, version_id: str) -> None:
+    # Deactivate all versions for that rubric/teacher
+    supabase.table("teacher_grader_versions").update({"is_active": False}).eq("teacher_id", teacher_id).eq("rubric_id", rubric_id).execute()
+    # Activate the chosen one
+    supabase.table("teacher_grader_versions").update({"is_active": True}).eq("id", version_id).execute()
+
+def list_grader_versions(teacher_id: str, rubric_id: str) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("teacher_grader_versions")
+        .select("*")
+        .eq("teacher_id", teacher_id)
+        .eq("rubric_id", rubric_id)
+        .order("version", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+def get_active_grader_version(teacher_id: str, rubric_id: str) -> Optional[Dict[str, Any]]:
+    res = (
+        supabase.table("teacher_grader_versions")
+        .select("*")
+        .eq("teacher_id", teacher_id)
+        .eq("rubric_id", rubric_id)
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    return (res.data or [None])[0]
+
+# ---------- Grade Requests / Results ----------
+def create_grade_request(student_id: str, teacher_id: str, rubric_id: str,
+                         writing_id: Optional[str] = None, text: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "student_id": student_id,
+        "teacher_id": teacher_id,
+        "rubric_id": rubric_id,
+        "writing_id": writing_id,
+        "text": text,
+        "status": "queued",
+    }
+    res = supabase.table("grade_requests").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def mark_grade_request_status(request_id: str, status: str) -> None:
+    assert status in ("queued", "graded", "error")
+    supabase.table("grade_requests").update({"status": status}).eq("id", request_id).execute()
+
+def insert_grade_result(request_id: str, overall: float, per_criterion: Dict[str, Any],
+                        rationales: Dict[str, Any], confidence: str,
+                        model_version_id: Optional[str] = None,
+                        tokens_used: Optional[int] = None, latency_ms: Optional[int] = None) -> Dict[str, Any]:
+    payload = {
+        "request_id": request_id,
+        "overall": overall,
+        "per_criterion": per_criterion,
+        "rationales": rationales,
+        "confidence": confidence,
+        "model_version_id": model_version_id,
+        "tokens_used": tokens_used,
+        "latency_ms": latency_ms,
+    }
+    res = supabase.table("grade_results").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def get_grade_result_by_request(request_id: str) -> Optional[Dict[str, Any]]:
+    res = supabase.table("grade_results").select("*").eq("request_id", request_id).single().execute()
+    return res.data
+
+def list_grade_requests_for_teacher(teacher_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("grade_requests")
+        .select("*")
+        .eq("teacher_id", teacher_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+def list_grade_requests_for_student(student_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("grade_requests")
+        .select("*")
+        .eq("student_id", student_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
