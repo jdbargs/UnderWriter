@@ -270,3 +270,20 @@ def insert_flow_progress(goal_id: str, attempt_id: str, metric_value: float, del
     payload = {"goal_id": goal_id, "attempt_id": attempt_id, "metric_value": metric_value, "delta": delta}
     res = supabase.table("flow_progress").insert(payload).execute()
     return (res.data or [None])[0]
+
+# --- Profiles / Roles ---
+def get_profile(user_id: str):
+    res = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    return res.data
+
+def upsert_profile(user_id: str, display_name: str = None, school: str = None, role: str = None):
+    payload = {"id": user_id}
+    if display_name is not None: payload["display_name"] = display_name
+    if school is not None: payload["school"] = school
+    if role is not None: payload["role"] = role
+    res = supabase.table("profiles").upsert(payload).execute()
+    return (res.data or [None])[0]
+
+def is_teacher(user_id: str) -> bool:
+    p = get_profile(user_id)
+    return bool(p and p.get("role") in ("teacher","admin"))

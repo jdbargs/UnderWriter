@@ -415,3 +415,57 @@ if st.session_state.user is None:
     auth_screen()
 else:
     app_screen()
+
+# imports near top
+from src.db import get_profile, upsert_profile, is_teacher  # added
+
+# in app_screen(), after title/caption:
+uid = current_user_id()
+prof = get_profile(uid) if uid else None
+role = (prof or {}).get("role", "student")
+
+# quick dev switch (optional): let user toggle teacher for now
+with st.expander("Profile"):
+    st.write(f"Role: **{role}**")
+    colA, colB = st.columns(2)
+    new_name = colA.text_input("Display name", value=(prof or {}).get("display_name","") )
+    new_school = colB.text_input("School (optional)", value=(prof or {}).get("school","") )
+    if st.button("Save profile"):
+        upsert_profile(uid, display_name=new_name, school=new_school)
+        st.success("Profile saved.")
+
+# Tabs: Writing | FlowState | (Teacher Console if teacher)
+tabs = ["Writing Companion", "FlowState (Practice)"]
+if role in ("teacher","admin"):
+    tabs.append("Teacher Console")
+
+tab_objs = st.tabs(tabs)
+
+# existing content:
+with tab_objs[0]:
+    # Writing Companion ... (existing code)
+    ...
+
+with tab_objs[1]:
+    # FlowState ... (existing flowstate_section())
+    flowstate_section()
+
+# NEW Teacher Console (skeleton)
+if role in ("teacher","admin"):
+    with tab_objs[2]:
+        st.subheader("Teacher Console")
+        st.write("Create and manage your grading tools here.")
+
+        t1, t2, t3 = st.tabs(["Rubrics", "Grader Versions", "Classes (soon)"])
+
+        with t1:
+            st.caption("Define a rubric with criteria, descriptors, and weights.")
+            st.info("Coming next: rubric table + criteria editor.")
+
+        with t2:
+            st.caption("Train/activate your grading configuration.")
+            st.info("Coming next: anchor selection, leniency, versioning.")
+
+        with t3:
+            st.caption("Manage classes and enrollments for student access.")
+            st.info("Coming next: class codes and enroll/roster.")
