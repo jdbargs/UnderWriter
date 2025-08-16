@@ -26,11 +26,16 @@ from src.db import (
     # FlowState additions
     create_flow_session, random_flow_prompt, insert_flow_attempt,
     insert_flow_metrics, user_metric_baseline, insert_flow_feedback,
+    create_flow_prompt, list_flow_prompts_for_teacher, set_flow_prompt_active,
+    assign_prompts_to_assignment, remove_prompt_from_assignment, list_prompts_for_assignment,
+    random_assigned_prompt,  # if you want to call it in UI
     # GradeSim
     create_rubric, list_rubrics, get_rubric, archive_rubric,
     add_rubric_criterion, list_rubric_criteria, update_rubric_criterion, delete_rubric_criterion,
     add_grading_sample, list_grading_samples, delete_grading_sample,
     create_grader_version, list_grader_versions, set_active_grader_version, get_active_grader_version,
+    # Assignments
+    create_assignment, list_assignments, get_assignment, update_assignment, delete_assignment,
     # Roles
     get_profile, upsert_profile
 )
@@ -40,7 +45,8 @@ from src.supabase_client import supabase
 from src.analyzer import analyze_text, analyze_flow_text, compute_flow_composite
 from src.tone_classifier import classify_tone
 from src.ai_feedback import get_ai_feedback, get_flow_feedback
-from src.ai_grader import extract_rubric_schema
+from src.ai_grader import extract_rubric_schema, extract_scored_sample, grade_with_rubric
+
 
 st.set_page_config(page_title="UnderWriter", page_icon="✍️", layout="centered")
 
@@ -123,6 +129,11 @@ def flowstate_section():
         st.info("Sign in to use FlowState.")
         return
 
+    # Role detection
+    prof = get_profile(uid) if uid else None
+    role = (prof or {}).get("role", "student")
+    is_teacher = role in ("teacher", "admin")
+
     # Initialize session state
     defaults = {
         "fs_session_id": None,
@@ -134,10 +145,70 @@ def flowstate_section():
         "fs_target_words": 120,
         "fs_goals": [],
         "fs_response": "",
+        "fs_use_my_prompts": False,  # teacher option
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
+    # --------------------------
+    # Teacher prompt management
+    # --------------------------
+    if is_teacher:
+        with st.expander("Teacher: Manage FlowState prompts"):
+            with st.form("create_flow_prompt_form"):
+                p1, p2 = st.columns([3,1])
+                new_prompt_text = p1.text_area(
+                    "New prompt",
+                    height=100,
+                    placeholder="E.g., Describe a small sound that reveals a larger story.",
+                    key="fsp_new_text",
+                )
+                tag_str = p2.text_input("Tags (comma-sep)", placeholder="sensory, narrative", key="fsp_tags")
+                level = p2.selectbox("Level (optional)", ["", "9th", "10th", "11th", "12th"], index=0, key="fsp_level")
+                active = p2.checkbox("Active", value=True, key="fsp_active")
+                addp = st.form_submit_button("Add prompt")
+                if addp and new_prompt_text.strip():
+                    tags = [t.strip() for t in (tag_str or "").split(",") if t.strip()]
+                    create_flow_prompt(uid, new_prompt_text.strip(), tags=tags, level=(level or None) or None, active=active)
+                    st.success("Prompt created.")
+                    st.rerun()
+
+            # List teacher prompts
+            teacher_prompts = list_flow_prompts_for_teacher(uid, active_only=False)
+            if not teacher_prompts:
+                st.caption("You haven’t created any prompts yet.")
+            else:
+                st.markdown("**Your prompts**")
+                for p in teacher_prompts[:50]:
+                    colx, coly = st.columns([6,2])
+                    colx.write(f"• {p['text'][:100]}{'…' if len(p['text'])>100 else ''}")
+                    new_act = coly.checkbox(
+                        "Active", value=p.get("active", True), key=f"fsp_toggle_{p['id']}"
+                    )
+                    # If toggled, update
+                    if new_act != p.get("active", True):
+                        set_flow_prompt_active(p["id"], new_act)
+                        st.experimental_rerun()
+
+            # Option for teachers to pull *only* from their prompts when starting a burst
+            st.session_state.fs_use_my_prompts = st.checkbox(
+                "When I start a burst, use only my prompts (not global)",
+                value=st.session_state.fs_use_my_prompts,
+                key="fsp_use_mine",
+            )
+
+    # Helper: pick a random teacher prompt (active)
+    def _random_teacher_prompt(teacher_id: str):
+        rows = list_flow_prompts_for_teacher(teacher_id, active_only=True)
+        if not rows:
+            return None
+        import random
+        r = random.choice(rows)
+        return {"id": r["id"], "text": r["text"]}
+
+    # --------------------------
+    # Setup form (student view)
+    # --------------------------
     with st.form("fs_setup", clear_on_submit=False):
         st.subheader("Setup")
         c1, c2, c3 = st.columns(3)
@@ -185,7 +256,7 @@ def flowstate_section():
         st.session_state.fs_target_words = int(target_words)
         st.session_state.fs_goals = goals
 
-        # Create session and fetch a prompt
+        # Create session
         session = create_flow_session(
             user_id=uid,
             mode=st.session_state.fs_mode,
@@ -194,7 +265,13 @@ def flowstate_section():
             goal_focus=st.session_state.fs_goals,
         )
         st.session_state.fs_session_id = session["id"]
-        prompt_row = random_flow_prompt()
+
+        # Choose a prompt
+        prompt_row = None
+        if is_teacher and st.session_state.fs_use_my_prompts:
+            prompt_row = _random_teacher_prompt(uid)
+        if not prompt_row:
+            prompt_row = random_flow_prompt()
         st.session_state.fs_prompt = (prompt_row or {}).get(
             "text", "Write the first thing that comes to mind about a sound you can hear right now."
         )
@@ -292,17 +369,22 @@ def flowstate_section():
             st.metric("Composite", f'{metrics_row["composite_score"]}')
 
             if trend_bits:
-                st.caption("Trends vs 7‑day baseline: " + " · ".join(trend_bits))
+                st.caption("Trends vs 7-day baseline: " + " · ".join(trend_bits))
 
-            st.markdown("**Micro‑feedback**")
+            st.markdown("**Micro-feedback**")
             st.write(fb)
 
-            # Prep for another round, keep same session
-            prompt_row = random_flow_prompt()
-            st.session_state.fs_prompt = (prompt_row or {}).get(
+            # Prep for another round
+            next_prompt = None
+            if is_teacher and st.session_state.fs_use_my_prompts:
+                next_prompt = _random_teacher_prompt(uid)
+            if not next_prompt:
+                next_prompt = random_flow_prompt()
+
+            st.session_state.fs_prompt = (next_prompt or {}).get(
                 "text", "Write the first thing that comes to mind about a texture you can feel."
             )
-            st.session_state.fs_prompt_id = (prompt_row or {}).get("id")
+            st.session_state.fs_prompt_id = (next_prompt or {}).get("id")
             st.session_state.fs_response = ""
             st.session_state.fs_started_at = None
             st.info("New prompt loaded. Hit **Begin writing** when ready.")
@@ -345,7 +427,6 @@ def _read_uploaded_text(uploaded_file) -> str:
 def gradesim_teacher_section():
     st.header("GradeSim — Teacher Console")
 
-    # user/role
     uid = current_user_id()
     prof = get_profile(uid) if uid else None
     role = (prof or {}).get("role", "student")
@@ -353,13 +434,11 @@ def gradesim_teacher_section():
         st.info("Only teachers can access GradeSim. Update your profile role to 'teacher' if you're testing.")
         return
 
-    # ---- Rubric import (upload → extract → tweak → save) ----
+    # ---- Rubric import (upload → extract → tweak weights → save) ----
     st.subheader("Create or import a rubric")
     up_col1, up_col2 = st.columns([2,1])
     with up_col1:
-        uploaded = st.file_uploader(
-            "Upload rubric (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], key="rubric_uploader"
-        )
+        uploaded = st.file_uploader("Upload rubric (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"], key="rubric_uploader")
     with up_col2:
         scale_choice = st.selectbox("Preferred scale (fallback)", ["0-4", "0-100"], index=0, key="pref_scale_select")
 
@@ -374,29 +453,10 @@ def gradesim_teacher_section():
                 schema["scale"] = scale_choice
 
             st.success(f"Extracted: {schema.get('title','(untitled)')}")
-            crit_names = [c["name"] for c in schema["criteria"]]
-            st.markdown("**Criteria & weights (adjust if needed)**")
-            new_weights = []
-            for idx, c in enumerate(schema["criteria"]):
-                col1, col2 = st.columns([3,2])
-                col1.write(f"**{c['name']}**")
-                w = col2.slider(
-                    f"Weight: {c['name']}",
-                    0.0, 1.0, float(c.get("weight", 0.25)),
-                    0.05, key=f"rubric_weight_{idx}"
-                )
-                new_weights.append(w)
-            total = sum(new_weights) or 1.0
-            for i, c in enumerate(schema["criteria"]):
-                c["weight"] = round(new_weights[i] / total, 4)
-
-            st.markdown("**Preview**")
             st.dataframe(
                 [{"Criterion": c["name"], "Weight": c["weight"]} for c in schema["criteria"]],
                 use_container_width=True,
             )
-            st.caption("Descriptor levels were captured; you can refine them later.")
-
             if st.button("Save rubric", key="save_extracted_rubric_btn"):
                 rrow = create_rubric(
                     teacher_id=uid,
@@ -415,113 +475,180 @@ def gradesim_teacher_section():
                 st.success(f"Saved rubric '{rrow['title']}' with {len(schema['criteria'])} criteria.")
 
     st.divider()
-    st.subheader("Manage rubrics / criteria (optional)")
+
+    # ---- Pick rubric, manage assignments ----
+    st.subheader("Assignments")
     rubrics = list_rubrics(uid)
     if not rubrics:
         st.caption("No rubrics yet. Upload one above.")
         return
 
     rubric_map = {f"{r['title']} ({r['id'][:8]})": r for r in rubrics}
-    sel_label = st.selectbox("Select a rubric", list(rubric_map.keys()), key="rubric_select_existing")
+    sel_label = st.selectbox("Rubric", list(rubric_map.keys()), key="gs_rubric_select")
     rubric = rubric_map[sel_label]
-    st.markdown(f"**Selected:** {rubric['title']} — scale `{rubric['scale']}`")
 
-    crits = list_rubric_criteria(rubric["id"])
-    if crits:
-        for c in crits:
-            with st.expander(f"{c['name']} — weight {c['weight']}"):
-                st.json(c["descriptor_levels"], expanded=False)
-                colu1, colu2, colu3 = st.columns([1,1,1])
-                new_name = colu1.text_input(
-                    f"Rename ({c['id'][:6]})",
-                    value=c["name"],
-                    key=f"crit_name_{c['id']}"
-                )
-                new_weight = colu2.number_input(
-                    f"Weight ({c['id'][:6]})",
-                    min_value=0.0, max_value=1.0,
-                    value=float(c["weight"]),
-                    step=0.05,
-                    key=f"crit_weight_{c['id']}"
-                )
-                if colu3.button(f"Save ({c['id'][:6]})", key=f"crit_save_{c['id']}"):
-                    update_rubric_criterion(c["id"], name=new_name, weight=new_weight)
-                    st.success("Updated. Refresh to see changes.")
-                if st.button(f"Delete criterion {c['id'][:6]}", key=f"crit_del_{c['id']}"):
-                    delete_rubric_criterion(c["id"])
-                    st.warning("Deleted. Refresh to see changes.")
+    # Create assignment
+    with st.form("create_assignment"):
+        a1, a2, a3 = st.columns([2,1,1])
+        a_title = a1.text_input("Assignment title", placeholder="Narrative #1 — Seasons", key="assn_title_input")
+        a_period = a2.text_input("Period/Section (optional)", key="assn_period_input")
+        a_due = a3.date_input("Due date (optional)", key="assn_due_input")
+        leniency = st.slider("Leniency for this assignment (0=stricter, 1=lenient)", 0.0, 1.0, 0.5, 0.05, key="assn_leniency_slider")
+        create_a = st.form_submit_button("Create assignment")
+        if create_a:
+            row = create_assignment(
+                teacher_id=uid, rubric_id=rubric["id"], title=a_title.strip() or "Untitled Assignment",
+                period=a_period or None, due_date=(a_due.isoformat() if a_due else None), leniency=leniency
+            )
+            st.success(f"Assignment created: {row['title']}")
 
-    # ---- (Optional) Manual add criterion retained, but no JSON required to use GradeSim ----
-    with st.form("add_criterion"):
-        st.caption("Add a criterion (optional)")
-        cc1, cc2 = st.columns([1,1])
-        name = cc1.text_input("Criterion name", placeholder="Thesis, Evidence, Organization…", key="crit_add_name")
-        weight = cc2.number_input("Weight (0–1)", min_value=0.0, max_value=1.0, value=0.25, step=0.05, key="crit_add_weight")
-        st.write("Descriptor levels (JSON): e.g. {\"4\":\"mastery…\",\"3\":\"…\",\"2\":\"…\",\"1\":\"…\",\"0\":\"…\"}")
-        raw_json = st.text_area("Descriptors JSON", height=120, placeholder='{"4":"…","3":"…","2":"…","1":"…","0":"…"}', key="crit_add_desc_json")
-        addc = st.form_submit_button("Add criterion", use_container_width=True)
-        if addc:
-            try:
-                import json
-                desc = json.loads(raw_json) if raw_json.strip() else {"4":"","3":"","2":"","1":"","0":""}
-                add_rubric_criterion(rubric["id"], name=name.strip(), descriptor_levels=desc, weight=float(weight))
-                st.success("Criterion added.")
-            except Exception as e:
-                st.error(f"Bad JSON or save failed: {e}")
+    assignments = list_assignments(uid, rubric_id=rubric["id"])
+    if not assignments:
+        st.caption("No assignments yet for this rubric.")
+        return
+
+    assignment_map = {f"{a['title']} ({a.get('period') or 'all'}) [{a['id'][:6]}]": a for a in assignments}
+    sel_asn = st.selectbox("Select assignment", list(assignment_map.keys()), key="gs_assignment_select")
+    assignment = assignment_map[sel_asn]
 
     st.divider()
-    st.subheader("Grading Samples (Anchors)")
-    samples = list_grading_samples(uid, rubric_id=rubric["id"])
-    if samples:
-        for s in samples[:10]:
+
+    # ---- Upload graded samples (Essay + Filled rubric) ----
+    st.subheader("Upload graded sample")
+    s1, s2 = st.columns(2)
+    essay_file = s1.file_uploader("Student essay (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="sample_essay_upload")
+    graded_rubric_file = s2.file_uploader("Filled/graded rubric (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="sample_rubric_upload")
+    sample_title = st.text_input("Optional label", placeholder="Student A — Draft 1", key="sample_label_input")
+
+    if st.button("Extract & Save sample", key="sample_save_btn"):
+        if not graded_rubric_file:
+            st.warning("Please upload the filled rubric for this sample.")
+        else:
+            essay_text = _read_uploaded_text(essay_file) if essay_file else ""
+            rubric_text = _read_uploaded_text(graded_rubric_file)
+            # Fetch rubric schema from DB to guide extraction
+            crits = list_rubric_criteria(rubric["id"])
+            schema = {
+                "title": rubric["title"],
+                "scale": rubric["scale"],
+                "criteria": [{"name": c["name"], "weight": float(c["weight"]), "descriptor_levels": c["descriptor_levels"]} for c in crits],
+            }
+            from src.ai_grader import extract_scored_sample
+            with st.spinner("Reading the filled rubric…"):
+                scored = extract_scored_sample(rubric_text, schema)
+            st.json(scored, expanded=False)
+
+            row = add_grading_sample(
+                teacher_id=uid,
+                rubric_id=rubric["id"],
+                assignment_id=assignment["id"],
+                title=sample_title or None,
+                text=essay_text or rubric_text,  # store essay if present, else rubric text for backref
+                overall=scored.get("overall"),
+                per_criterion=scored.get("per_criterion"),
+                rationales=scored.get("rationales"),
+            )
+            st.success(f"Saved graded sample {row['id'][:8]}.")
+
+    # Show recent samples for this assignment
+    st.markdown("**Recent samples for this assignment**")
+    samples = list_grading_samples(uid, rubric_id=rubric["id"], assignment_id=assignment["id"])
+    if not samples:
+        st.caption("No samples yet.")
+    else:
+        for s in samples[:8]:
             with st.expander(f"{(s.get('title') or '(untitled)')} — {s['id'][:8]}"):
-                st.code(s["text"][:800] + ("..." if len(s["text"]) > 800 else ""))
                 st.json({"overall": s.get("overall"), "per_criterion": s.get("per_criterion")}, expanded=False)
-                if st.button(f"Delete sample {s['id'][:6]}", key=f"sample_del_{s['id']}"):
-                    delete_grading_sample(s["id"])
-                    st.warning("Sample deleted. Refresh to update list.")
 
-    with st.form("add_sample"):
-        st.caption("Add a graded sample (optional but improves calibration)")
-        s1, s2 = st.columns([2,1])
-        title = s1.text_input("Sample title (optional)", key="sample_title_input")
-        overall = s2.number_input(f"Overall ({rubric['scale']})", min_value=0.0, max_value=100.0, value=3.0, step=0.5, key="sample_overall_input")
-        text = st.text_area("Student text", height=180, key="sample_text_input")
-        st.write("Per-criterion scores JSON (e.g., {\"Thesis\":3,\"Evidence\":4})")
-        raw_scores = st.text_area("Scores JSON", height=100, key="sample_scores_json")
-        add_s = st.form_submit_button("Save sample", use_container_width=True)
-        if add_s:
-            try:
-                import json
-                pc = json.loads(raw_scores) if raw_scores.strip() else {}
-                add_grading_sample(uid, rubric["id"], title=title or None, text=text, overall=float(overall), per_criterion=pc)
-                st.success("Sample saved.")
-            except Exception as e:
-                st.error(f"Save failed: {e}")
-
+        # --- Self-test the grader on a paper you already graded ---
     st.divider()
-    st.subheader("Grader Versions")
-    versions = list_grader_versions(uid, rubric["id"])
-    active = get_active_grader_version(uid, rubric["id"])
-    if versions:
-        st.caption(f"Active version: **{active['version']}**" if active else "No active version.")
-        for v in versions:
-            with st.expander(f"Version {v['version']} — {'ACTIVE' if v['is_active'] else 'inactive'}"):
-                st.json({"method": v["method"], "config": v["config"], "train_stats": v.get("train_stats")})
-                if not v["is_active"]:
-                    if st.button(f"Activate v{v['version']}", key=f"activate_v_{v['id']}"):
-                        set_active_grader_version(uid, rubric["id"], v["id"])
-                        st.success("Activated.")
-    with st.form("new_version"):
-        st.caption("Create a new version (stores config; you control anchors & parameters)")
-        leniency = st.slider("Leniency (0=stricter, 1=lenient)", 0.0, 1.0, 0.5, 0.05, key="leniency_slider")
-        sample_options = {f"{(s.get('title') or 'untitled')} [{s['id'][:6]}]": s["id"] for s in samples}
-        chosen = st.multiselect("Anchor samples (recommended: 3–6 across the range)", list(sample_options.keys()), key="anchor_multiselect")
-        create_v = st.form_submit_button("Create version", use_container_width=True)
-        if create_v:
-            config = {"leniency": leniency, "anchors": [sample_options[k] for k in chosen]}
-            vrow = create_grader_version(uid, rubric["id"], config=config, method="few_shot_prompt", train_stats=None, is_active=False)
-            st.success(f"Created version {vrow['version']}. Activate when ready.")
+    st.subheader("Self-test the grader")
+
+    test_col1, test_col2 = st.columns([2,1])
+    test_essay = test_col1.file_uploader("Upload a student essay to test (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="selftest_essay")
+    use_active = test_col2.checkbox("Use ACTIVE grader version (if any)", value=True, key="selftest_use_active")
+
+    # Build rubric schema
+    crits = list_rubric_criteria(rubric["id"])
+    rubric_schema = {
+        "title": rubric["title"],
+        "scale": rubric["scale"],
+        "criteria": [
+            {"name": c["name"], "weight": float(c["weight"]), "descriptor_levels": c["descriptor_levels"]}
+            for c in crits
+        ],
+    }
+
+    # Collect anchors
+    # Prefer active version’s chosen anchors; else use latest samples for this assignment
+    anchors = []
+    leniency_hint = assignment.get("leniency", 0.5)
+    if use_active:
+        active = get_active_grader_version(uid, rubric["id"])
+        if active:
+            leniency_hint = active.get("config", {}).get("leniency", leniency_hint)
+            anchor_ids = active.get("config", {}).get("anchors", [])
+            if anchor_ids:
+                all_for_asn = list_grading_samples(uid, rubric_id=rubric["id"], assignment_id=assignment["id"])
+                by_id = {s["id"]: s for s in all_for_asn}
+                anchors = [by_id[aid] for aid in anchor_ids if aid in by_id]
+
+    if not anchors:
+        anchors = list_grading_samples(uid, rubric_id=rubric["id"], assignment_id=assignment["id"])[:6]
+
+    # Optional: let teacher key in *their* true scores to compare (no JSON)
+    with st.expander("Enter your true scores (optional) to compare"):
+        teacher_overall = st.number_input(f"Your overall ({rubric['scale']})", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="selftest_teacher_overall")
+        teacher_scores = {}
+        for i, c in enumerate(rubric_schema["criteria"]):
+            teacher_scores[c["name"]] = st.number_input(
+                f"{c['name']}",
+                min_value=0.0, max_value=100.0, value=0.0, step=0.5,
+                key=f"selftest_teacher_{i}"
+            )
+
+    if st.button("Run self-test", key="selftest_run_btn"):
+        if not test_essay:
+            st.warning("Upload an essay to test.")
+        else:
+            essay_text = _read_uploaded_text(test_essay)
+            with st.spinner("Grading with your rubric and anchors…"):
+                # Convert anchors to the minimal structure expected by grade_with_rubric
+                anchor_min = [{"text": a.get("text") or "", "overall": a.get("overall"), "per_criterion": a.get("per_criterion")} for a in anchors]
+                pred = grade_with_rubric(essay_text, rubric_schema, anchors=anchor_min, leniency=leniency_hint)
+
+            # Show prediction
+            st.markdown("**Predicted grade**")
+            st.json(pred, expanded=False)
+
+            # If the teacher entered their true scores, compare
+            if any(v != 0.0 for v in teacher_scores.values()) or teacher_overall != 0.0:
+                import math
+                rows = []
+                abs_diffs = []
+                for c in rubric_schema["criteria"]:
+                    name = c["name"]
+                    ai = pred["per_criterion"].get(name)
+                    tr = teacher_scores.get(name)
+                    if ai is None or tr is None:
+                        delta = None
+                    else:
+                        delta = ai - tr
+                        abs_diffs.append(abs(delta))
+                    rows.append({"Criterion": name, "AI": ai, "Teacher": tr, "Δ (AI–Teacher)": delta})
+
+                # Simple MAE on criteria that both provided
+                mae = (sum(abs_diffs)/len(abs_diffs)) if abs_diffs else None
+                o_ai = pred.get("overall")
+                o_tr = teacher_overall if teacher_overall != 0.0 else None
+                o_delta = (o_ai - o_tr) if (o_ai is not None and o_tr is not None) else None
+
+                # Render compact comparison table
+                st.markdown("**Comparison**")
+                st.dataframe(rows, use_container_width=True)
+                st.write(f"**Criterion MAE:** {mae:.2f}" if mae is not None else "**Criterion MAE:** n/a")
+                st.write(f"**Overall Δ (AI–Teacher):** {o_delta:.2f}" if o_delta is not None else "**Overall Δ:** n/a")
+
 
 # ----------------------------
 # App UI (authed)

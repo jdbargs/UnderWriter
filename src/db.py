@@ -271,6 +271,67 @@ def insert_flow_progress(goal_id: str, attempt_id: str, metric_value: float, del
     res = supabase.table("flow_progress").insert(payload).execute()
     return (res.data or [None])[0]
 
+# ---------- Flow Prompts (teacher-owned) ----------
+def create_flow_prompt(teacher_id: str, text: str, tags: Optional[List[str]] = None,
+                       level: Optional[str] = None, active: bool = True) -> Dict[str, Any]:
+    payload = {
+        "teacher_id": teacher_id,
+        "text": text,
+        "tags": tags or [],
+        "level": level,
+        "active": active,
+    }
+    res = supabase.table("flow_prompts").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_flow_prompts_for_teacher(teacher_id: str, active_only: bool = True) -> List[Dict[str, Any]]:
+    q = supabase.table("flow_prompts").select("*").eq("teacher_id", teacher_id)
+    if active_only:
+        q = q.eq("active", True)
+    q = q.order("created_at", desc=True)
+    res = q.execute()
+    return res.data or []
+
+def set_flow_prompt_active(prompt_id: str, active: bool) -> None:
+    supabase.table("flow_prompts").update({"active": active}).eq("id", prompt_id).execute()
+
+# ---------- Prompt ↔ Assignment linking ----------
+def assign_prompts_to_assignment(assignment_id: str, prompt_ids: List[str]) -> None:
+    if not prompt_ids:
+        return
+    rows = [{"assignment_id": assignment_id, "prompt_id": pid} for pid in prompt_ids]
+    supabase.table("flow_prompt_assignments").upsert(rows, on_conflict="assignment_id,prompt_id").execute()
+
+def remove_prompt_from_assignment(assignment_id: str, prompt_id: str) -> None:
+    supabase.table("flow_prompt_assignments").delete().eq("assignment_id", assignment_id).eq("prompt_id", prompt_id).execute()
+
+def list_prompts_for_assignment(assignment_id: str) -> List[Dict[str, Any]]:
+    # join flow_prompt_assignments -> flow_prompts
+    res = (
+        supabase.table("flow_prompt_assignments")
+        .select("id, sort, flow_prompts(id, text, tags, level, active, teacher_id)")
+        .eq("assignment_id", assignment_id)
+        .order("sort", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    # Flatten
+    out = []
+    for r in rows:
+        p = r.get("flow_prompts") or {}
+        p["link_id"] = r["id"]
+        p["sort"] = r.get("sort")
+        out.append(p)
+    return out
+
+def random_assigned_prompt(assignment_id: str) -> Optional[Dict[str, Any]]:
+    rows = list_prompts_for_assignment(assignment_id)
+    rows = [r for r in rows if r.get("active", True)]
+    if not rows:
+        return None
+    import random
+    return random.choice(rows)
+
 # --- Profiles / Roles ---
 def get_profile(user_id: str):
     res = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
@@ -519,4 +580,69 @@ def list_grade_requests_for_student(student_id: str, limit: int = 50) -> List[Di
         .limit(limit)
         .execute()
     )
+    return res.data or []
+
+# ---------- Assignments ----------
+def create_assignment(teacher_id: str, rubric_id: str, title: str,
+                      period: Optional[str] = None, due_date: Optional[str] = None,
+                      leniency: float = 0.5) -> Dict[str, Any]:
+    payload = {
+        "teacher_id": teacher_id,
+        "rubric_id": rubric_id,
+        "title": title,
+        "period": period,
+        "due_date": due_date,
+        "leniency": leniency,
+    }
+    res = supabase.table("assignments").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_assignments(teacher_id: str, rubric_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    q = (supabase.table("assignments").select("*").eq("teacher_id", teacher_id)
+         .order("created_at", desc=True))
+    if rubric_id:
+        q = q.eq("rubric_id", rubric_id)
+    res = q.execute()
+    return res.data or []
+
+def get_assignment(assignment_id: str) -> Optional[Dict[str, Any]]:
+    res = supabase.table("assignments").select("*").eq("id", assignment_id).single().execute()
+    return res.data
+
+def update_assignment(assignment_id: str, **patch) -> Optional[Dict[str, Any]]:
+    if not patch:
+        return get_assignment(assignment_id)
+    res = supabase.table("assignments").update(patch).eq("id", assignment_id).execute()
+    return (res.data or [None])[0]
+
+def delete_assignment(assignment_id: str) -> None:
+    supabase.table("assignments").delete().eq("id", assignment_id).execute()
+
+# ---------- Grading Samples (updated to include assignment_id) ----------
+def add_grading_sample(teacher_id: str, rubric_id: str, assignment_id: str,
+                       title: Optional[str], text: str, overall: Optional[float],
+                       per_criterion: Optional[Dict[str, Any]],
+                       rationales: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "teacher_id": teacher_id,
+        "rubric_id": rubric_id,
+        "assignment_id": assignment_id,
+        "title": title,
+        "text": text,
+        "overall": overall,
+        "per_criterion": per_criterion or {},
+        "rationales": rationales or {},
+    }
+    res = supabase.table("grading_samples").insert(payload).execute()
+    return (res.data or [None])[0]
+
+def list_grading_samples(teacher_id: str, rubric_id: Optional[str] = None,
+                         assignment_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    q = (supabase.table("grading_samples").select("*").eq("teacher_id", teacher_id)
+         .order("created_at", desc=True).limit(limit))
+    if rubric_id:
+        q = q.eq("rubric_id", rubric_id)
+    if assignment_id:
+        q = q.eq("assignment_id", assignment_id)
+    res = q.execute()
     return res.data or []
