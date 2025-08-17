@@ -5,6 +5,26 @@ import random
 
 from .supabase_client import supabase
 
+# ---------- FlowState Defaults ----------
+# Fill these with your 10 strong defaults (plain strings).
+DEFAULT_FLOW_PROMPTS = [
+    # "Describe a small sound that reveals a larger story.",
+    # "Write about a fleeting expression you noticed today.",
+    # "Describe an object as if it were alive.",
+    # "Write about a moment of silence and what it contained.",
+    # "Zoom in on a single texture and make it feel vivid.",
+    # "Write a paragraph that pivots halfway through on a single word.",
+    # "Describe a place using only verbs and nouns (no adjectives).",
+    # "Tell a story through what’s missing, not what’s present.",
+    # "Rewrite a cliché without the cliché words.",
+    # "Make an emotion visible using only concrete images."
+]
+
+def get_default_flow_prompts() -> List[Dict[str, Any]]:
+    """Return defaults shaped like DB rows, so callers can treat them the same."""
+    return [{"id": None, "text": p, "source": "default"} for p in DEFAULT_FLOW_PROMPTS]
+
+
 # ---------- Auth ----------
 def sign_up(email: str, password: str):
     return supabase.auth.sign_up({"email": email, "password": password})
@@ -120,19 +140,38 @@ def list_style_snapshots(user_id: str) -> List[Dict[str, Any]]:
 # ==========================================================
 
 # ---------- Prompts ----------
+import random
+
 def random_flow_prompt(tag: Optional[str] = None, difficulty: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
-    Fetch up to 50 recent prompts (optionally filtered) and return one at random.
-    For proper weighting/randomness, consider a server-side RPC later.
+    Fetch up to 50 recent prompts (optionally filtered) from Supabase and return one at random.
+    Falls back to hardcoded defaults if none exist in the DB.
     """
     q = supabase.table("flow_prompts").select("*")
-    if tag:
+
+    # Optional filters (keep your existing schema fields)
+    if tag is not None:
         q = q.eq("tag", tag)
-    if difficulty:
+    if difficulty is not None:
         q = q.eq("difficulty", difficulty)
+
+    # Prefer active prompts if you added that column
+    try:
+        q = q.eq("active", True)
+    except Exception:
+        # If 'active' column doesn't exist, ignore
+        pass
+
     res = q.order("created_at", desc=True).limit(50).execute()
     rows = res.data or []
-    return random.choice(rows) if rows else None
+
+    # Fallback to defaults if DB has none
+    if not rows:
+        defaults = get_default_flow_prompts()
+        return random.choice(defaults) if defaults else None
+
+    return random.choice(rows)
+
 
 # ---------- Sessions ----------
 def create_flow_session(
