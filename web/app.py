@@ -4,6 +4,7 @@ import sys, os
 from datetime import datetime, timezone
 import io
 
+
 # Optional file parsers for rubric uploads
 try:
     import PyPDF2
@@ -37,7 +38,9 @@ from src.db import (
     # Assignments
     create_assignment, list_assignments, get_assignment, update_assignment, delete_assignment,
     # Roles
-    get_profile, upsert_profile
+    get_profile, upsert_profile,
+    # Activity
+    log_activity, get_user_overview, get_user_context_pack
 )
 from src.supabase_client import supabase
 
@@ -341,6 +344,19 @@ def flowstate_section():
                     "composite_score": composite,
                 },
             )
+            try:
+                log_activity(uid, "flow_burst_submitted", {
+                    "attempt_id": attempt["id"],
+                    "elapsed_seconds": metrics_row["elapsed_seconds"],
+                    "word_count": metrics_row["word_count"],
+                    "vocab_ttr": metrics_row["vocab_ttr"],
+                    "composite": metrics_row["composite_score"],
+                    "goals": st.session_state.fs_goals,
+                    "mode": st.session_state.fs_mode,
+                })
+            except Exception:
+                pass
+
 
             # Goal deltas vs 7-day baseline
             trend_bits = []
@@ -616,6 +632,17 @@ def gradesim_teacher_section():
                 # Convert anchors to the minimal structure expected by grade_with_rubric
                 anchor_min = [{"text": a.get("text") or "", "overall": a.get("overall"), "per_criterion": a.get("per_criterion")} for a in anchors]
                 pred = grade_with_rubric(essay_text, rubric_schema, anchors=anchor_min, leniency=leniency_hint)
+                try:
+                    log_activity(uid, "gradesim_selftest_run", {
+                        "rubric_id": rubric["id"],
+                        "assignment_id": assignment["id"] if "assignment" in locals() else None,
+                        "used_active_version": bool(use_active),
+                        "leniency_hint": leniency_hint,
+                        "has_teacher_scores": any(v != 0.0 for v in teacher_scores.values()) or teacher_overall != 0.0
+                    })
+                except Exception:
+                    pass
+
 
             # Show prediction
             st.markdown("**Predicted grade**")
@@ -669,6 +696,23 @@ def app_screen():
     uid = current_user_id()
     prof = get_profile(uid) if uid else None
     role = (prof or {}).get("role", "student")
+
+    from src.db import get_user_overview  # ensure imported
+
+    uid = current_user_id()
+    if uid:
+        try:
+            ov = get_user_overview(uid)
+            with st.expander("Your activity overview", expanded=False):
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Writings", ov.get("writings_count", 0))
+                c2.metric("Flow sessions", ov.get("flow_sessions_count", 0))
+                c3.metric("Flow bursts", ov.get("flow_attempts_count", 0))
+                c4.metric("GradeSim tests", ov.get("gradesim_selftests_count", 0))
+                c5.metric("Streak (days)", ov.get("streak_days", 0))
+        except Exception:
+            pass
+
 
     with st.expander("Profile"):
         st.write(f"Role: **{role}**")
@@ -729,6 +773,12 @@ def app_screen():
             writing = save_writing(uid, text, title=title or None, metadata={})
             writing_id = writing["id"]
 
+            # NEW: log the activity
+            try:
+                log_activity(uid, "writing_submitted", {"writing_id": writing_id, "title": title or None})
+            except Exception:
+                pass
+
             # 2) Internal metrics (optional)
             try:
                 metrics = analyze_text(text)
@@ -742,7 +792,8 @@ def app_screen():
             feedback = None
             try:
                 profile_summary = "Learning your style; reflections deepen as you write more."
-                feedback = get_ai_feedback(text, profile_summary)
+                ctx_pack = get_user_context_pack(uid)
+                feedback = get_ai_feedback(text, profile_summary, ctx_pack)  # change signature
                 st.markdown("**Reflection:**")
                 st.write(feedback)
             except Exception as e:

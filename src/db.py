@@ -1,23 +1,22 @@
 # src/db.py
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
-import random
 
 from .supabase_client import supabase
 
 # ---------- FlowState Defaults ----------
 # Fill these with your 10 strong defaults (plain strings).
 DEFAULT_FLOW_PROMPTS = [
-    # "Describe a small sound that reveals a larger story.",
-    # "Write about a fleeting expression you noticed today.",
-    # "Describe an object as if it were alive.",
-    # "Write about a moment of silence and what it contained.",
-    # "Zoom in on a single texture and make it feel vivid.",
-    # "Write a paragraph that pivots halfway through on a single word.",
-    # "Describe a place using only verbs and nouns (no adjectives).",
-    # "Tell a story through what’s missing, not what’s present.",
-    # "Rewrite a cliché without the cliché words.",
-    # "Make an emotion visible using only concrete images."
+    "Write only the very beginning of a long novel.",
+    "Describe every detail about the present moment you can muster.",
+    "Take the perspective of an object you can currently see, as if it were alive.",
+    "Recount a dream you can remember.",
+    "Make an argument about something that bothers you.",
+    "Imagine a place without naming or knowing it. Describe what you see.",
+    "Retell and embellish a recent dialogue you heard.",
+    "Consider a ridiculous idea with seriousness and sincerity.",
+    "Pretend you are an astronaut floating in space.",
+    "Write exclusively in rhyme."
 ]
 
 def get_default_flow_prompts() -> List[Dict[str, Any]]:
@@ -142,35 +141,45 @@ def list_style_snapshots(user_id: str) -> List[Dict[str, Any]]:
 # ---------- Prompts ----------
 import random
 
-def random_flow_prompt(tag: Optional[str] = None, difficulty: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def random_flow_prompt(
+    tag: Optional[str] = None,
+    difficulty: Optional[int] = None,
+    include_defaults: bool = True  # <-- NEW: include your hardcoded defaults by default
+) -> Optional[Dict[str, Any]]:
     """
-    Fetch up to 50 recent prompts (optionally filtered) from Supabase and return one at random.
-    Falls back to hardcoded defaults if none exist in the DB.
+    Pick a random FlowState prompt.
+    - Pulls up to 50 active prompts from Supabase (optionally filtered by tag/difficulty).
+    - If include_defaults=True, mixes in your hardcoded defaults even when the DB has rows.
     """
     q = supabase.table("flow_prompts").select("*")
 
-    # Optional filters (keep your existing schema fields)
     if tag is not None:
         q = q.eq("tag", tag)
     if difficulty is not None:
         q = q.eq("difficulty", difficulty)
 
-    # Prefer active prompts if you added that column
+    # Prefer active prompts if column exists
     try:
         q = q.eq("active", True)
     except Exception:
-        # If 'active' column doesn't exist, ignore
         pass
 
     res = q.order("created_at", desc=True).limit(50).execute()
     rows = res.data or []
 
-    # Fallback to defaults if DB has none
-    if not rows:
-        defaults = get_default_flow_prompts()
-        return random.choice(defaults) if defaults else None
+    pool = rows[:]  # DB prompts
+    if include_defaults:
+        pool += get_default_flow_prompts()  # your 10 defaults
 
-    return random.choice(rows)
+    if not pool:
+        return None
+
+    return random.choice(pool)
+
+def list_all_flow_prompts(include_defaults: bool = True) -> List[Dict[str, Any]]:
+    res = supabase.table("flow_prompts").select("*").order("created_at", desc=True).limit(200).execute()
+    rows = res.data or []
+    return (rows + get_default_flow_prompts()) if include_defaults else rows
 
 
 # ---------- Sessions ----------
@@ -685,3 +694,142 @@ def list_grading_samples(teacher_id: str, rubric_id: Optional[str] = None,
         q = q.eq("assignment_id", assignment_id)
     res = q.execute()
     return res.data or []
+
+# =========================
+# === Activity Logging  ===
+# =========================
+
+def log_activity(user_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Append a single event to user_activity_log.
+    event_type examples:
+      'writing_submitted', 'flow_burst_submitted', 'gradesim_selftest_run',
+      'rubric_created', 'assignment_created', 'gradesim_anchor_added'
+    """
+    rec = {
+        "user_id": user_id,
+        "event_type": event_type,
+        "event_payload": payload or {},
+    }
+    res = supabase.table("user_activity_log").insert(rec).execute()
+    return (res.data or [None])[0]
+
+def list_activity(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    res = (
+        supabase.table("user_activity_log")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+def activity_streak_days(user_id: str) -> int:
+    """
+    Simple daily streak from user_activity_log.
+    Counts consecutive days (including today) with >=1 event.
+    """
+    # Pull last 60 days of events
+    since = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    res = (
+        supabase.table("user_activity_log")
+        .select("created_at")
+        .eq("user_id", user_id)
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return 0
+
+    # Build set of date strings in local UTC-day (naive)
+    days = set(r["created_at"][:10] for r in rows)  # 'YYYY-MM-DD'
+    today = datetime.now(timezone.utc).date()
+    streak = 0
+    d = today
+    while d.strftime("%Y-%m-%d") in days:
+        streak += 1
+        d = d - timedelta(days=1)
+    return streak
+
+# =========================
+# === Quick Aggregates  ===
+# =========================
+
+def count_flow_attempts(user_id: str) -> int:
+    res = supabase.table("flow_attempts").select("id", count="exact").eq("user_id", user_id).execute()
+    return res.count or 0
+
+def count_flow_sessions(user_id: str) -> int:
+    res = supabase.table("flow_sessions").select("id", count="exact").eq("user_id", user_id).execute()
+    return res.count or 0
+
+def count_gradesim_selftests(user_id: str) -> int:
+    # We log self-tests into user_activity_log with event_type='gradesim_selftest_run'
+    res = (
+        supabase.table("user_activity_log")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .eq("event_type", "gradesim_selftest_run")
+        .execute()
+    )
+    return res.count or 0
+
+def get_user_overview(user_id: str) -> Dict[str, Any]:
+    """
+    One-shot “omniscient” snapshot the AI can use before giving feedback.
+    Extend as needed.
+    """
+    try:
+        return {
+            "writings_count": count_writings(user_id),
+            "flow_sessions_count": count_flow_sessions(user_id),
+            "flow_attempts_count": count_flow_attempts(user_id),
+            "gradesim_selftests_count": count_gradesim_selftests(user_id),
+            "streak_days": activity_streak_days(user_id),
+        }
+    except Exception:
+        # Never block feedback if an aggregate fails
+        return {}
+
+def get_user_context_pack(user_id: str, k_recent: int = 5) -> Dict[str, Any]:
+    """A compact, always-available bundle the AI can read before responding."""
+    from typing import cast
+    # counts & streak
+    overview = get_user_overview(user_id)
+    # recent writings (ids + short excerpts)
+    w = (
+        supabase.table("writings")
+        .select("id, created_at, title, text")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(k_recent)
+        .execute()
+        .data or []
+    )
+    recent_samples = []
+    for row in w:
+        txt = (row.get("text") or "").strip()
+        if len(txt) > 400: txt = txt[:400] + "…"
+        recent_samples.append({"id": row["id"], "title": row.get("title"), "excerpt": txt})
+
+    # latest style profile & traits if present
+    profile = get_style_profile(user_id) or {}
+    # recent micro-signals from FlowState
+    fm = list_flow_recent_metrics(user_id, limit=10)
+    goals = [g.get("focus") for g in (active_flow_goals(user_id) or [])]
+
+    return {
+        "overview": overview,                      # counts, streak
+        "style_profile": {
+            "summary": profile.get("summary"),
+            "traits": profile.get("traits") or {},
+            "last_updated": profile.get("last_updated"),
+        },
+        "recent_samples": recent_samples,          # last few excerpts
+        "flow_metrics_recent": fm,                 # last N attempts metrics
+        "active_goals": goals,                     # playfulness/clarity/creativity
+    }
