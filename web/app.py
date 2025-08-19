@@ -4,6 +4,7 @@ import sys, os
 from datetime import datetime, timezone
 import io
 
+# ❗ No CSS injection — rely on config.toml theme
 
 # Optional file parsers for rubric uploads
 try:
@@ -29,7 +30,7 @@ from src.db import (
     insert_flow_metrics, user_metric_baseline, insert_flow_feedback,
     create_flow_prompt, list_flow_prompts_for_teacher, set_flow_prompt_active,
     assign_prompts_to_assignment, remove_prompt_from_assignment, list_prompts_for_assignment,
-    random_assigned_prompt,  # if you want to call it in UI
+    random_assigned_prompt,
     # GradeSim
     create_rubric, list_rubrics, get_rubric, archive_rubric,
     add_rubric_criterion, list_rubric_criteria, update_rubric_criterion, delete_rubric_criterion,
@@ -49,7 +50,6 @@ from src.analyzer import analyze_text, analyze_flow_text, compute_flow_composite
 from src.tone_classifier import classify_tone
 from src.ai_feedback import get_ai_feedback, get_flow_feedback
 from src.ai_grader import extract_rubric_schema, extract_scored_sample, grade_with_rubric
-
 
 st.set_page_config(page_title="UnderWriter", page_icon="✍️", layout="centered")
 
@@ -73,10 +73,8 @@ except Exception:
     pass
 
 def current_user_id():
-    # Prefer cached
     if st.session_state.user and "id" in st.session_state.user:
         return st.session_state.user["id"]
-    # Fallback to client
     try:
         u = get_current_user().user
         return u.id if u else None
@@ -132,12 +130,10 @@ def flowstate_section():
         st.info("Sign in to use FlowState.")
         return
 
-    # Role detection
     prof = get_profile(uid) if uid else None
     role = (prof or {}).get("role", "student")
     is_teacher = role in ("teacher", "admin")
 
-    # Initialize session state
     defaults = {
         "fs_session_id": None,
         "fs_prompt": None,
@@ -148,14 +144,11 @@ def flowstate_section():
         "fs_target_words": 120,
         "fs_goals": [],
         "fs_response": "",
-        "fs_use_my_prompts": False,  # teacher option
+        "fs_use_my_prompts": False,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
-    # --------------------------
-    # Teacher prompt management
-    # --------------------------
     if is_teacher:
         with st.expander("Teacher: Manage FlowState prompts"):
             with st.form("create_flow_prompt_form"):
@@ -176,7 +169,6 @@ def flowstate_section():
                     st.success("Prompt created.")
                     st.rerun()
 
-            # List teacher prompts
             teacher_prompts = list_flow_prompts_for_teacher(uid, active_only=False)
             if not teacher_prompts:
                 st.caption("You haven’t created any prompts yet.")
@@ -188,19 +180,16 @@ def flowstate_section():
                     new_act = coly.checkbox(
                         "Active", value=p.get("active", True), key=f"fsp_toggle_{p['id']}"
                     )
-                    # If toggled, update
                     if new_act != p.get("active", True):
                         set_flow_prompt_active(p["id"], new_act)
                         st.experimental_rerun()
 
-            # Option for teachers to pull *only* from their prompts when starting a burst
             st.session_state.fs_use_my_prompts = st.checkbox(
                 "When I start a burst, use only my prompts (not global)",
                 value=st.session_state.fs_use_my_prompts,
                 key="fsp_use_mine",
             )
 
-    # Helper: pick a random teacher prompt (active)
     def _random_teacher_prompt(teacher_id: str):
         rows = list_flow_prompts_for_teacher(teacher_id, active_only=True)
         if not rows:
@@ -209,9 +198,6 @@ def flowstate_section():
         r = random.choice(rows)
         return {"id": r["id"], "text": r["text"]}
 
-    # --------------------------
-    # Setup form (student view)
-    # --------------------------
     with st.form("fs_setup", clear_on_submit=False):
         st.subheader("Setup")
         c1, c2, c3 = st.columns(3)
@@ -253,13 +239,11 @@ def flowstate_section():
         start_burst = st.form_submit_button("Start burst", use_container_width=True)
 
     if start_burst:
-        # Persist setup
         st.session_state.fs_mode = mode
         st.session_state.fs_duration = int(duration)
         st.session_state.fs_target_words = int(target_words)
         st.session_state.fs_goals = goals
 
-        # Create session
         session = create_flow_session(
             user_id=uid,
             mode=st.session_state.fs_mode,
@@ -269,7 +253,6 @@ def flowstate_section():
         )
         st.session_state.fs_session_id = session["id"]
 
-        # Choose a prompt
         prompt_row = None
         if is_teacher and st.session_state.fs_use_my_prompts:
             prompt_row = _random_teacher_prompt(uid)
@@ -287,14 +270,12 @@ def flowstate_section():
         st.markdown("#### Prompt")
         st.info(st.session_state.fs_prompt)
 
-        # Begin writing → record start time
         if st.session_state.fs_started_at is None:
             if st.button("Begin writing", key="fs_begin_btn"):
                 st.session_state.fs_started_at = datetime.now(timezone.utc)
         else:
             st.caption(f"Started at {st.session_state.fs_started_at.isoformat()} (UTC)")
 
-        # Text area
         st.session_state.fs_response = st.text_area(
             "Your burst (submit in one go; keep it spontaneous)",
             value=st.session_state.fs_response,
@@ -303,12 +284,10 @@ def flowstate_section():
             key="fs_response_text",
         )
 
-        # Submit attempt
         if st.session_state.fs_started_at and st.button("Submit", key="fs_submit_btn"):
             end_time = datetime.now(timezone.utc)
             elapsed = (end_time - st.session_state.fs_started_at).total_seconds()
 
-            # Save attempt
             attempt = insert_flow_attempt(
                 session_id=st.session_state.fs_session_id,
                 prompt_id=st.session_state.fs_prompt_id,
@@ -323,7 +302,6 @@ def flowstate_section():
                 },
             )
 
-            # Metrics
             m = analyze_flow_text(st.session_state.fs_response)
             composite = compute_flow_composite(
                 elapsed_seconds=elapsed, metrics=m, goal_focus=st.session_state.fs_goals
@@ -357,8 +335,6 @@ def flowstate_section():
             except Exception:
                 pass
 
-
-            # Goal deltas vs 7-day baseline
             trend_bits = []
             for focus in st.session_state.fs_goals:
                 key = f"{focus}_score"
@@ -368,13 +344,11 @@ def flowstate_section():
                 trend_bits.append(f"{focus.capitalize()} {('+' if delta >= 0 else '')}{delta:.2f}")
             last_trends = "; ".join(trend_bits) if trend_bits else "no active goal trend"
 
-            # Micro-feedback (≤3 sentences)
             fb = get_flow_feedback(
                 st.session_state.fs_response, st.session_state.fs_goals, last_trends=last_trends
             )
             insert_flow_feedback(attempt_id=attempt["id"], user_id=uid, feedback_text=fb)
 
-            # UI result
             st.success("Submitted!")
             b1, b2, b3, b4, b5 = st.columns(5)
             b1.metric("WPM", f'{metrics_row["wpm"]}')
@@ -387,10 +361,6 @@ def flowstate_section():
             if trend_bits:
                 st.caption("Trends vs 7-day baseline: " + " · ".join(trend_bits))
 
-            st.markdown("**Micro-feedback**")
-            st.write(fb)
-
-            # Prep for another round
             next_prompt = None
             if is_teacher and st.session_state.fs_use_my_prompts:
                 next_prompt = _random_teacher_prompt(uid)
@@ -434,7 +404,6 @@ def _read_uploaded_text(uploaded_file) -> str:
         except Exception:
             return "(Could not parse DOCX. Try a PDF or .txt.)"
 
-    # Fallback: treat as text
     try:
         return data.decode("utf-8", errors="ignore")
     except Exception:
@@ -450,7 +419,6 @@ def gradesim_teacher_section():
         st.info("Only teachers can access GradeSim. Update your profile role to 'teacher' if you're testing.")
         return
 
-    # ---- Rubric import (upload → extract → tweak weights → save) ----
     st.subheader("Create or import a rubric")
     up_col1, up_col2 = st.columns([2,1])
     with up_col1:
@@ -492,7 +460,6 @@ def gradesim_teacher_section():
 
     st.divider()
 
-    # ---- Pick rubric, manage assignments ----
     st.subheader("Assignments")
     rubrics = list_rubrics(uid)
     if not rubrics:
@@ -503,7 +470,6 @@ def gradesim_teacher_section():
     sel_label = st.selectbox("Rubric", list(rubric_map.keys()), key="gs_rubric_select")
     rubric = rubric_map[sel_label]
 
-    # Create assignment
     with st.form("create_assignment"):
         a1, a2, a3 = st.columns([2,1,1])
         a_title = a1.text_input("Assignment title", placeholder="Narrative #1 — Seasons", key="assn_title_input")
@@ -529,7 +495,6 @@ def gradesim_teacher_section():
 
     st.divider()
 
-    # ---- Upload graded samples (Essay + Filled rubric) ----
     st.subheader("Upload graded sample")
     s1, s2 = st.columns(2)
     essay_file = s1.file_uploader("Student essay (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="sample_essay_upload")
@@ -542,14 +507,12 @@ def gradesim_teacher_section():
         else:
             essay_text = _read_uploaded_text(essay_file) if essay_file else ""
             rubric_text = _read_uploaded_text(graded_rubric_file)
-            # Fetch rubric schema from DB to guide extraction
             crits = list_rubric_criteria(rubric["id"])
             schema = {
                 "title": rubric["title"],
                 "scale": rubric["scale"],
                 "criteria": [{"name": c["name"], "weight": float(c["weight"]), "descriptor_levels": c["descriptor_levels"]} for c in crits],
             }
-            from src.ai_grader import extract_scored_sample
             with st.spinner("Reading the filled rubric…"):
                 scored = extract_scored_sample(rubric_text, schema)
             st.json(scored, expanded=False)
@@ -559,14 +522,13 @@ def gradesim_teacher_section():
                 rubric_id=rubric["id"],
                 assignment_id=assignment["id"],
                 title=sample_title or None,
-                text=essay_text or rubric_text,  # store essay if present, else rubric text for backref
+                text=essay_text or rubric_text,
                 overall=scored.get("overall"),
                 per_criterion=scored.get("per_criterion"),
                 rationales=scored.get("rationales"),
             )
             st.success(f"Saved graded sample {row['id'][:8]}.")
 
-    # Show recent samples for this assignment
     st.markdown("**Recent samples for this assignment**")
     samples = list_grading_samples(uid, rubric_id=rubric["id"], assignment_id=assignment["id"])
     if not samples:
@@ -576,7 +538,6 @@ def gradesim_teacher_section():
             with st.expander(f"{(s.get('title') or '(untitled)')} — {s['id'][:8]}"):
                 st.json({"overall": s.get("overall"), "per_criterion": s.get("per_criterion")}, expanded=False)
 
-        # --- Self-test the grader on a paper you already graded ---
     st.divider()
     st.subheader("Self-test the grader")
 
@@ -584,7 +545,6 @@ def gradesim_teacher_section():
     test_essay = test_col1.file_uploader("Upload a student essay to test (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="selftest_essay")
     use_active = test_col2.checkbox("Use ACTIVE grader version (if any)", value=True, key="selftest_use_active")
 
-    # Build rubric schema
     crits = list_rubric_criteria(rubric["id"])
     rubric_schema = {
         "title": rubric["title"],
@@ -595,8 +555,6 @@ def gradesim_teacher_section():
         ],
     }
 
-    # Collect anchors
-    # Prefer active version’s chosen anchors; else use latest samples for this assignment
     anchors = []
     leniency_hint = assignment.get("leniency", 0.5)
     if use_active:
@@ -612,7 +570,6 @@ def gradesim_teacher_section():
     if not anchors:
         anchors = list_grading_samples(uid, rubric_id=rubric["id"], assignment_id=assignment["id"])[:6]
 
-    # Optional: let teacher key in *their* true scores to compare (no JSON)
     with st.expander("Enter your true scores (optional) to compare"):
         teacher_overall = st.number_input(f"Your overall ({rubric['scale']})", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="selftest_teacher_overall")
         teacher_scores = {}
@@ -629,7 +586,6 @@ def gradesim_teacher_section():
         else:
             essay_text = _read_uploaded_text(test_essay)
             with st.spinner("Grading with your rubric and anchors…"):
-                # Convert anchors to the minimal structure expected by grade_with_rubric
                 anchor_min = [{"text": a.get("text") or "", "overall": a.get("overall"), "per_criterion": a.get("per_criterion")} for a in anchors]
                 pred = grade_with_rubric(essay_text, rubric_schema, anchors=anchor_min, leniency=leniency_hint)
                 try:
@@ -643,39 +599,30 @@ def gradesim_teacher_section():
                 except Exception:
                     pass
 
-
-            # Show prediction
             st.markdown("**Predicted grade**")
             st.json(pred, expanded=False)
 
-            # If the teacher entered their true scores, compare
             if any(v != 0.0 for v in teacher_scores.values()) or teacher_overall != 0.0:
-                import math
                 rows = []
                 abs_diffs = []
                 for c in rubric_schema["criteria"]:
                     name = c["name"]
                     ai = pred["per_criterion"].get(name)
                     tr = teacher_scores.get(name)
-                    if ai is None or tr is None:
-                        delta = None
-                    else:
-                        delta = ai - tr
+                    delta = (ai - tr) if (ai is not None and tr is not None) else None
+                    if delta is not None:
                         abs_diffs.append(abs(delta))
                     rows.append({"Criterion": name, "AI": ai, "Teacher": tr, "Δ (AI–Teacher)": delta})
 
-                # Simple MAE on criteria that both provided
                 mae = (sum(abs_diffs)/len(abs_diffs)) if abs_diffs else None
                 o_ai = pred.get("overall")
                 o_tr = teacher_overall if teacher_overall != 0.0 else None
                 o_delta = (o_ai - o_tr) if (o_ai is not None and o_tr is not None) else None
 
-                # Render compact comparison table
                 st.markdown("**Comparison**")
                 st.dataframe(rows, use_container_width=True)
                 st.write(f"**Criterion MAE:** {mae:.2f}" if mae is not None else "**Criterion MAE:** n/a")
                 st.write(f"**Overall Δ (AI–Teacher):** {o_delta:.2f}" if o_delta is not None else "**Overall Δ:** n/a")
-
 
 # ----------------------------
 # App UI (authed)
@@ -684,62 +631,15 @@ def app_screen():
     st.title("✍️ UnderWriter")
     st.caption(f"Logged in as {st.session_state.user['email']}")
 
-    if st.button("Log out", key="logout_btn"):
-        try:
-            sign_out()
-        finally:
-            st.session_state.user = None
-            st.session_state.sb_session = None
-            st.rerun()
-
-    # ---- Role / Profile ----
     uid = current_user_id()
     prof = get_profile(uid) if uid else None
     role = (prof or {}).get("role", "student")
-
-    from src.db import get_user_overview  # ensure imported
-
-    uid = current_user_id()
-    if uid:
-        try:
-            ov = get_user_overview(uid)
-            with st.expander("Your activity overview", expanded=False):
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Writings", ov.get("writings_count", 0))
-                c2.metric("Flow sessions", ov.get("flow_sessions_count", 0))
-                c3.metric("Flow bursts", ov.get("flow_attempts_count", 0))
-                c4.metric("GradeSim tests", ov.get("gradesim_selftests_count", 0))
-                c5.metric("Streak (days)", ov.get("streak_days", 0))
-        except Exception:
-            pass
-
-
-    with st.expander("Profile"):
-        st.write(f"Role: **{role}**")
-        colA, colB = st.columns(2)
-        new_name = colA.text_input(
-            "Display name",
-            value=(prof or {}).get("display_name", ""),
-            key="profile_display_name_input",
-        )
-        new_school = colB.text_input(
-            "School (optional)",
-            value=(prof or {}).get("school", ""),
-            key="profile_school_input",
-        )
-        if st.button("Save profile", key="profile_save_btn"):
-            upsert_profile(uid, display_name=new_name, school=new_school)
-            st.success("Profile saved.")
-
-    # ---- Tabs: Writing | FlowState | (GradeSim if teacher) ----
-    tabs = ["Writing Companion", "FlowState (Practice)"]
     is_teacher_role = role in ("teacher", "admin")
-    if is_teacher_role:
-        tabs.append("GradeSim (Teacher)")
 
+    # Top: three main tabs
+    tabs = ["Writing Companion", "FlowState (Practice)", "GradeSim (Teacher)"]
     t_objs = st.tabs(tabs)
 
-    # --- Tab 0: Writing Companion ---
     with t_objs[0]:
         st.subheader("New Writing")
         title = st.text_input("Title (optional)", key="wc_title_input")
@@ -760,26 +660,21 @@ def app_screen():
             return "brisk"
 
         if st.button("Analyze & Save", key="wc_analyze_btn"):
-            uid = current_user_id()
-            if not uid:
+            uid2 = current_user_id()
+            if not uid2:
                 st.error("You must be signed in to save.")
                 st.stop()
-
             if not text.strip():
                 st.warning("Please enter some text.")
                 st.stop()
 
-            # 1) Save writing
-            writing = save_writing(uid, text, title=title or None, metadata={})
+            writing = save_writing(uid2, text, title=title or None, metadata={})
             writing_id = writing["id"]
-
-            # NEW: log the activity
             try:
-                log_activity(uid, "writing_submitted", {"writing_id": writing_id, "title": title or None})
+                log_activity(uid2, "writing_submitted", {"writing_id": writing_id, "title": title or None})
             except Exception:
                 pass
 
-            # 2) Internal metrics (optional)
             try:
                 metrics = analyze_text(text)
                 tone = classify_tone(text)
@@ -788,18 +683,16 @@ def app_screen():
             except Exception:
                 metrics, tone, intention, energy = {}, None, None, None
 
-            # 3) LLM reflection (optional)
             feedback = None
             try:
                 profile_summary = "Learning your style; reflections deepen as you write more."
-                ctx_pack = get_user_context_pack(uid)
-                feedback = get_ai_feedback(text, profile_summary, ctx_pack)  # change signature
+                ctx_pack = get_user_context_pack(uid2)
+                feedback = get_ai_feedback(text, profile_summary, ctx_pack)
                 st.markdown("**Reflection:**")
                 st.write(feedback)
             except Exception as e:
                 st.info(f"(AI feedback unavailable) {e}")
 
-            # 4) Insert insights + feedback rows
             try:
                 insert_writing_insight(
                     writing_id=writing_id,
@@ -819,19 +712,17 @@ def app_screen():
             except Exception as e:
                 st.error(f"Save insights/feedback failed: {e}")
 
-            # 5) Periodic style snapshot
             try:
-                total = count_writings(uid)
+                total = count_writings(uid2)
                 if total % 5 == 0:
                     snap = f"By entry {total}, tone leans '{tone}' with '{intention}' intent; energy '{energy}'."
-                    upsert_style_profile(uid, summary=snap, traits={})
-                    insert_style_snapshot(uid, snapshot=snap, signals={})
+                    upsert_style_profile(uid2, summary=snap, traits={})
+                    insert_style_snapshot(uid2, snapshot=snap, signals={})
             except Exception:
                 pass
 
         st.divider()
         st.subheader("Your Past Writings")
-        uid = current_user_id()
         if not uid:
             st.warning("Please sign in to view your writings.")
         else:
@@ -846,14 +737,56 @@ def app_screen():
             except Exception as e:
                 st.error(f"Could not load writings: {e}")
 
-    # --- Tab 1: FlowState ---
     with t_objs[1]:
         flowstate_section()
 
-    # --- Tab 2: GradeSim (Teacher) ---
-    if is_teacher_role:
-        with t_objs[2]:
+    with t_objs[2]:
+        if is_teacher_role:
             gradesim_teacher_section()
+        else:
+            st.info("GradeSim is available to teacher/admin roles.")
+
+    # Bottom: Activity overview → Profile → Log out
+    st.divider()
+    try:
+        ov = get_user_overview(uid) if uid else None
+        if ov:
+            st.subheader("Activity overview")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Writings", ov.get("writings_count", 0))
+            c2.metric("Flow sessions", ov.get("flow_sessions_count", 0))
+            c3.metric("Flow bursts", ov.get("flow_attempts_count", 0))
+            c4.metric("GradeSim tests", ov.get("gradesim_selftests_count", 0))
+            c5.metric("Streak (days)", ov.get("streak_days", 0))
+    except Exception:
+        pass
+
+    st.divider()
+    st.subheader("Profile")
+    st.write(f"Role: **{role}**")
+    colA, colB = st.columns(2)
+    new_name = colA.text_input(
+        "Display name",
+        value=(prof or {}).get("display_name", ""),
+        key="profile_display_name_input",
+    )
+    new_school = colB.text_input(
+        "School (optional)",
+        value=(prof or {}).get("school", ""),
+        key="profile_school_input",
+    )
+    if st.button("Save profile", key="profile_save_btn"):
+        upsert_profile(uid, display_name=new_name, school=new_school)
+        st.success("Profile saved.")
+
+    st.divider()
+    if st.button("Log out", key="logout_btn", use_container_width=True):
+        try:
+            sign_out()
+        finally:
+            st.session_state.user = None
+            st.session_state.sb_session = None
+            st.rerun()
 
 # ---- Entry point ----
 try:
