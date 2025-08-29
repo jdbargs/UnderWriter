@@ -1,6 +1,16 @@
 [theme]
 base = "light"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#FFFFFF"
-textColor = "#000000"
-primaryColor = "#000000"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+primaryColor = "#FF4B4B"
+font = "sans serif"
+
+[client]
+# Add borders and other styling
+toolbarMode = "auto"
+showSidebarNavigation = true
+
+[runner]
+# Control spacing and layout
+magicEnabled = true
