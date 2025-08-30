@@ -1,1 +1,3 @@
 # UnderWriter
+
+A LLM-based writing assistant protoype intended for classroom use with the aim of increasing a students control of language confining creativty. Offers student and teacher roles, associates user activity with thier profile. Components include a writing companion (non-generative, purely reflective), a flowstate practice section (students can write spontaneous short responses to a teacher supplied or default prompt), and a grading simulator (teacher gives LLM context on thier grading style, students can simulate a grading session). Utilizes LLMs to structure unstructured data and build a useful user profile, and to interface the user to with a specific goal. Data is stored in a database, and retrieved when relevant. 
